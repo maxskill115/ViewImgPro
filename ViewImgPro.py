@@ -1,19 +1,24 @@
 # -*- coding: utf-8 -*-
-r"""ViewImgPro - fast image review, filtering and zoom-crop for Windows.
+r"""ViewImgPro - fast image + video review, filtering and zoom-crop for Windows.
 
-Install: py -m pip install Pillow
-Run:     py viewimgpro.py
+Install:  py -m pip install Pillow
+Optional: py -m pip install pillow-heif      (to open .heic / .heif photos)
+Videos:   need FFmpeg (the same ffmpeg.exe used by the "Video → IMG" button) for preview,
+          seeking, playback (no audio) and cropping.
+Run:      py viewimgpro.py
 
-Select a parent folder or a single image folder. The tool scans directories recursively
-for image files, so source video files are not needed. Example:
-F:\Downloads\img\IMG_Khach\IMG_4759\frame_0001.jpg
-Selected images are COPIED to the matching folder's "Đã lọc hình" subfolder.
-"Copy cắt theo khung zoom" saves each selected image cropped to the region currently shown
-in the viewer (same zoom level and position) as <name>_crop.<ext> in the same "Đã lọc hình" folder.
+Select a parent folder or a single folder. The tool scans directories recursively for
+image AND video files (see IMAGE_EXTS / VIDEO_EXTS below). Example:
+F:\Downloads\img\IMG_Khach\IMG_4759\frame_0001.jpg      or      F:\Downloads\video\IMG_4759.MOV
+Selected files are COPIED to the matching folder's "Đã lọc hình" subfolder.
+"Copy cắt theo khung zoom" saves each selected file cropped to the region currently shown
+in the viewer (same zoom level and position) as <name>_crop.<ext> in the same "Đã lọc hình"
+folder. Videos are cropped with FFmpeg and saved as <name>_crop.mp4 (re-encoded H.264, audio kept).
 Original files are never moved or deleted.
 """
 from __future__ import annotations
 
+import io
 import os
 import math
 import queue
@@ -34,7 +39,34 @@ try:
 except ImportError:
     raise SystemExit("Chưa cài Pillow. Mở CMD và chạy: py -m pip install Pillow")
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+# Optional decoders. pillow-heif adds .heic/.heif; pillow-avif-plugin adds .avif on older Pillow.
+for _plugin in ("pillow_heif", "pillow_avif"):
+    try:
+        _module = __import__(_plugin)
+        if _plugin == "pillow_heif":
+            _module.register_heif_opener()
+    except Exception:
+        pass
+
+IMAGE_EXTS = {
+    ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".apng", ".webp", ".bmp", ".dib",
+    ".gif", ".tif", ".tiff", ".ico", ".tga", ".ppm", ".pgm", ".pbm", ".pnm",
+    ".jp2", ".j2k", ".jpx", ".avif", ".heic", ".heif",
+}
+# ".ts" is deliberately left out: it is far more often a TypeScript source file than a video.
+VIDEO_EXTS = {
+    ".mp4", ".m4v", ".mov", ".avi", ".mkv", ".wmv", ".webm", ".mpeg", ".mpg", ".mpe",
+    ".3gp", ".3g2", ".mts", ".m2ts", ".flv", ".f4v", ".vob", ".ogv", ".asf",
+}
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
+
+PLAY_MAX_SIDE = 1280      # preview playback frames are scaled so the long side is at most this
+PLAY_MAX_FPS = 30         # preview playback frame-rate cap
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+class FFmpegMissingError(RuntimeError):
+    """Raised when a video needs FFmpeg but ffmpeg.exe cannot be found."""
 
 
 class VideoImageFilterApp:
@@ -86,6 +118,38 @@ class VideoImageFilterApp:
         self._checkbox_images = {}
         self.ffmpeg_path: Path | None = self._load_saved_ffmpeg_path()
 
+        # --- Video state (preview via FFmpeg) ----------------------------------
+        self.is_video = False
+        self._ffmpeg_exec: Path | None = None
+        self._video_info: dict[Path, tuple[float, float]] = {}   # path -> (duration s, fps)
+        self._video_time = 0.0
+        self._video_duration = 0.0
+        self._video_native_size = (0, 0)
+        self._frame_ratio = 1.0        # preview-frame width / native video width (1.0 for photos and paused frames);
+                                       # on-screen zoom in NATIVE px = cur_scale * ratio, cur_scale = zoom / ratio
+        self._video_bar_shown = False
+        self._playing = False
+        self._play_proc = None
+        self._play_stop: threading.Event | None = None
+        self._play_queue: queue.Queue | None = None
+        self._play_held = None
+        self._play_t0 = None
+        self._play_start_time = 0.0
+        self._play_fps = 24.0
+        self._play_after_id = None
+        self._slider_updating = False
+        self._seek_dragging = False
+        self._copy_busy = False
+
+        # --- "Bất đồng bộ di chuyển" (independent pan per file) -----------------
+        # OFF (default): zoom AND position carry over from file to file.
+        # ON : zoom still carries over, but every file keeps its OWN position. A file never opened
+        #      before starts at the baseline position (the view position when the mode was switched on).
+        self.async_pan = tk.BooleanVar(value=False)
+        self._pan_memory: dict[Path, tuple[float, float]] = {}   # path -> view centre as fraction of the image
+        self._pan_baseline = (0.5, 0.5)
+        self._displayed_path: Path | None = None                  # file whose pixels are on screen right now
+
         self._build_ui()
         # Space and Enter both toggle the checkbox of the image currently being viewed:
         # first press selects; the next press deselects.
@@ -98,6 +162,12 @@ class VideoImageFilterApp:
         self.root.bind_all("<Control-plus>", lambda _e: self.zoom_by(1.2))
         self.root.bind_all("<Control-equal>", lambda _e: self.zoom_by(1.2))
         self.root.bind_all("<Control-minus>", lambda _e: self.zoom_by(1 / 1.2))
+        # Video: P = play/pause, Shift+Left/Right = seek 5 s (Left/Right alone = previous/next file).
+        self.root.bind_all("<p>", self._play_shortcut)
+        self.root.bind_all("<P>", self._play_shortcut)
+        self.root.bind_all("<Shift-Left>", lambda e: self._seek_shortcut(e, -5.0))
+        self.root.bind_all("<Shift-Right>", lambda e: self._seek_shortcut(e, 5.0))
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(25, self._poll_render_queue)
 
     def _maximize_window(self):
@@ -138,7 +208,7 @@ class VideoImageFilterApp:
         self.root_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
         ttk.Button(top, text="Video → IMG", style="Tool.TButton", command=self.open_video_to_img_dialog).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(top, text="⟳ Tải lại", style="Tool.TButton", command=self.refresh_root).pack(side=tk.RIGHT, padx=(5, 0))
-        ttk.Button(top, text="Copy ảnh đã chọn", style="Tool.TButton", command=self.copy_selected).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(top, text="Copy file đã chọn", style="Tool.TButton", command=self.copy_selected).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(top, text="✂ Copy cắt theo khung zoom", style="Tool.TButton",
                    command=self.copy_selected_cropped).pack(side=tk.RIGHT, padx=(5, 0))
 
@@ -149,7 +219,7 @@ class VideoImageFilterApp:
         # LEFT: intentionally narrower by default; drag the sash to resize either pane.
         left = ttk.Frame(main, padding=8, width=360)
         main.add(left, weight=0)
-        ttk.Label(left, text="THƯ MỤC ẢNH", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(left, text="THƯ MỤC ẢNH / VIDEO", font=("Segoe UI", 10, "bold")).pack(anchor="w")
 
         folder_frame = ttk.Frame(left)
         folder_frame.pack(fill=tk.X, pady=(5, 8))
@@ -168,8 +238,8 @@ class VideoImageFilterApp:
         ttk.Separator(left).pack(fill=tk.X, pady=4)
         header = ttk.Frame(left)
         header.pack(fill=tk.X)
-        ttk.Label(header, text="DANH SÁCH ẢNH", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
-        self.count_label = ttk.Label(header, text="0 ảnh | 0 chọn", font=("Segoe UI", 9))
+        ttk.Label(header, text="DANH SÁCH ẢNH / VIDEO", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.count_label = ttk.Label(header, text="0 file | 0 chọn", font=("Segoe UI", 9))
         self.count_label.pack(side=tk.RIGHT)
 
         # Selection actions are split into two compact rows to fit the narrow left pane.
@@ -186,7 +256,7 @@ class VideoImageFilterApp:
         actions_row2 = ttk.Frame(actions)
         actions_row2.pack(fill=tk.X)
         ttk.Button(
-            actions_row2, text="Bỏ chọn ảnh đang xem", style="Tool.TButton", command=self.deselect_current
+            actions_row2, text="Bỏ chọn file đang xem", style="Tool.TButton", command=self.deselect_current
         ).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Label(
             actions_row2, text="Space / Enter: chọn-bỏ chọn", foreground="#4b5563"
@@ -207,22 +277,27 @@ class VideoImageFilterApp:
         self.image_tree.bind("<<TreeviewSelect>>", self.on_image_select)
         self.image_tree.bind("<Button-1>", self.on_tree_click, add=True)
 
-        self.selected_label = ttk.Label(left, text="Tổng ảnh đã chọn: 0", foreground="#176b35", font=("Segoe UI", 10, "bold"))
+        self.selected_label = ttk.Label(left, text="Tổng file đã chọn: 0", foreground="#176b35", font=("Segoe UI", 10, "bold"))
         self.selected_label.pack(anchor="w", pady=(7, 0))
         ttk.Label(
             left,
-            text="Ảnh đã chọn sẽ được copy vào thư mục con ‘Đã lọc hình’ của từng thư mục video.",
+            text="Ảnh/video đã chọn sẽ được copy vào thư mục con ‘Đã lọc hình’ nằm cạnh file gốc.",
             wraplength=360, foreground="#4b5563", font=("Segoe UI", 9)
         ).pack(anchor="w", pady=(4, 0))
 
         # RIGHT: image preview and zoom controls.
         right = ttk.Frame(main, padding=8)
         main.add(right, weight=1)
-        # Set a compact initial split once Tk has calculated the actual window size.
-        self.root.after(180, self._set_initial_sash)
+        # Giữ độ rộng cột trái cố định (LEFT_PANE_WIDTH) ngay cả khi cửa sổ vừa được phóng to.
+        self._sash_user_moved = False
+        self._sash_target = self.LEFT_PANE_WIDTH
+        self._sash_retry = 0
+        self.main_pane.bind("<Configure>", self._on_pane_configure, add=True)
+        self.main_pane.bind("<ButtonRelease-1>", self._on_sash_release, add=True)
+        self.root.after(50, self._set_initial_sash)
         toolbar = ttk.Frame(right)
         toolbar.pack(fill=tk.X, pady=(0, 7))
-        self.current_label = ttk.Label(toolbar, text="Chọn ảnh để xem", font=("Segoe UI", 10, "bold"))
+        self.current_label = ttk.Label(toolbar, text="Chọn ảnh hoặc video để xem", font=("Segoe UI", 10, "bold"))
         self.current_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(toolbar, text="Xoay trái", command=lambda: self.rotate_image(-90)).pack(side=tk.RIGHT, padx=2)
         ttk.Button(toolbar, text="Xoay phải", command=lambda: self.rotate_image(90)).pack(side=tk.RIGHT, padx=2)
@@ -231,7 +306,17 @@ class VideoImageFilterApp:
         ttk.Button(toolbar, text="−", width=3, command=lambda: self.zoom_by(1 / 1.2)).pack(side=tk.RIGHT, padx=2)
         ttk.Button(toolbar, text="+", width=3, command=lambda: self.zoom_by(1.2)).pack(side=tk.RIGHT, padx=2)
 
+        pan_row = ttk.Frame(right)
+        pan_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Checkbutton(pan_row, text="Bất đồng bộ di chuyển", variable=self.async_pan,
+                        command=self._on_async_pan_toggle).pack(side=tk.LEFT)
+        ttk.Button(pan_row, text="↺ Về vị trí gốc", command=self.reset_pan_current).pack(side=tk.LEFT, padx=8)
+        self.pan_hint = ttk.Label(pan_row, text="Đang đồng bộ: zoom và vị trí giữ nguyên khi qua file khác",
+                                  foreground="#4b5563", font=("Segoe UI", 9))
+        self.pan_hint.pack(side=tk.LEFT)
+
         canvas_frame = ttk.Frame(right)
+        self.canvas_frame = canvas_frame
         canvas_frame.pack(fill=tk.BOTH, expand=True)
         self.canvas = tk.Canvas(canvas_frame, background="#202124", highlightthickness=0, cursor="fleur")
         self.hbar = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self._xview_command)
@@ -249,16 +334,66 @@ class VideoImageFilterApp:
         self.canvas.bind("<ButtonRelease-1>", self._pan_end)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
+        # Video control bar: only shown while a video is selected (see _set_video_mode).
+        self.video_bar = ttk.Frame(right)
+        self.play_button = ttk.Button(self.video_bar, text="▶ Phát", width=9, command=self.toggle_play)
+        self.play_button.pack(side=tk.LEFT)
+        self.time_label = ttk.Label(self.video_bar, text="00:00 / --:--", width=15, anchor="center",
+                                    font=("Segoe UI", 9))
+        self.time_label.pack(side=tk.LEFT, padx=6)
+        ttk.Label(self.video_bar, text="P: phát/dừng · Shift+←/→: tua 5s · xem trước, không có tiếng",
+                  foreground="#4b5563", font=("Segoe UI", 8)).pack(side=tk.RIGHT, padx=(8, 0))
+        self.seek_scale = ttk.Scale(self.video_bar, from_=0.0, to=1.0, orient=tk.HORIZONTAL,
+                                    command=self._on_seek_slider)
+        self.seek_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.seek_scale.bind("<ButtonPress-1>", self._on_seek_press, add=True)
+        self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release, add=True)
+
         self.status = ttk.Label(self.root, text="Sẵn sàng", relief=tk.SUNKEN, anchor="w", padding=(8, 4))
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
-    def _set_initial_sash(self):
-        """Start with a compact left list; users can drag the sash afterward."""
+    LEFT_PANE_WIDTH = 365   # độ rộng mặc định của cột danh sách bên trái
+    LEFT_PANE_MIN = 320     # không cho kéo hẹp hơn mức này
+
+    def _apply_sash(self) -> bool:
+        """Đặt vách ngăn; trả về True nếu cửa sổ đã có kích thước thật và đặt thành công."""
         try:
-            # Tk coordinates are logical pixels; Windows display scaling is handled by Tk.
-            self.main_pane.sashpos(0, 365)
+            width = self.main_pane.winfo_width()
+            if width < self.LEFT_PANE_WIDTH * 2:       # chưa layout xong / chưa maximize xong
+                return False
+            self.main_pane.sashpos(0, self._sash_target)
+            return True
         except tk.TclError:
-            pass
+            return False
+
+    def _set_initial_sash(self):
+        """Đặt độ rộng cột trái lúc khởi động; thử lại đến khi Tk layout xong."""
+        if self._sash_user_moved:
+            return
+        if not self._apply_sash() and self._sash_retry < 60:
+            self._sash_retry += 1
+            self.root.after(100, self._set_initial_sash)
+
+    def _on_pane_configure(self, _event=None):
+        """Cửa sổ đổi kích thước (vd. maximize) -> giữ nguyên độ rộng cột trái nếu người dùng chưa kéo."""
+        if not self._sash_user_moved:
+            self.root.after_idle(self._apply_sash)
+
+    def _on_sash_release(self, _event=None):
+        """Người dùng kéo vách ngăn: ghi nhớ vị trí mới, chặn kéo quá hẹp."""
+        try:
+            pos = self.main_pane.sashpos(0)
+        except tk.TclError:
+            return
+        if pos < self.LEFT_PANE_MIN:
+            pos = self.LEFT_PANE_MIN
+            try:
+                self.main_pane.sashpos(0, pos)
+            except tk.TclError:
+                pass
+        if abs(pos - self._sash_target) > 2:
+            self._sash_user_moved = True
+            self._sash_target = pos
 
     @staticmethod
     def _make_checkbox(checked: bool):
@@ -294,7 +429,7 @@ class VideoImageFilterApp:
                 dirnames[:] = []
                 continue
             dirnames[:] = [name for name in dirnames if name.casefold() not in filtered_names]
-            if any(Path(filename).suffix.lower() in IMAGE_EXTS for filename in filenames):
+            if any(Path(filename).suffix.lower() in MEDIA_EXTS for filename in filenames):
                 found_folders.append(current_path)
 
         self.video_dirs = sorted(found_folders, key=lambda p: str(p).casefold())
@@ -323,7 +458,7 @@ class VideoImageFilterApp:
             self.image_tree.delete(*self.image_tree.get_children())
             self.clear_viewer()
             self.update_counts()
-        self.status.config(text=f"Quét thư mục hoàn tất: tìm thấy {len(self.video_dirs)} thư mục có ảnh.")
+        self.status.config(text=f"Quét thư mục hoàn tất: tìm thấy {len(self.video_dirs)} thư mục có ảnh/video.")
 
     def on_folder_select(self, _event=None):
         selection = self.folder_list.curselection()
@@ -333,7 +468,7 @@ class VideoImageFilterApp:
     def load_video_folder(self, folder: Path):
         self.current_dir = folder
         self.image_paths = sorted(
-            [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS],
+            [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTS],
             key=lambda p: p.name.lower()
         )
         self.path_to_index = {path: index for index, path in enumerate(self.image_paths)}
@@ -342,7 +477,7 @@ class VideoImageFilterApp:
         self.image_tree.delete(*self.image_tree.get_children())
         for index, path in enumerate(self.image_paths):
             self.image_tree.insert(
-                "", tk.END, iid=str(index), text=path.name,
+                "", tk.END, iid=str(index), text=self._row_text(path),
                 image=self._checkbox_images[path in self.selected]
             )
         self.update_counts()
@@ -353,8 +488,8 @@ class VideoImageFilterApp:
             self.display_image(self.image_paths[0])
         else:
             self.clear_viewer()
-            self.current_label.config(text=f"{folder.name} — không có ảnh")
-        self.status.config(text=f"{folder.name}: {len(self.image_paths)} ảnh")
+            self.current_label.config(text=f"{folder.name} — không có ảnh/video")
+        self.status.config(text=f"{folder.name}: {len(self.image_paths)} file")
 
     def on_tree_click(self, event):
         # A click on the large checkbox selects that row as the current preview too,
@@ -426,13 +561,27 @@ class VideoImageFilterApp:
     MAX_ZOOM = 8.0
 
     def display_image(self, path: Path):
+        """Show a photo OR a video (a video shows a still frame plus the control bar)."""
         if path == self.current_image:
             return
-        center = self._center_fraction()
+        self._stop_playback()
+        if self.async_pan.get():
+            self._remember_current_pan()
+            center = self._pan_memory.get(path, self._pan_baseline)
+        else:
+            center = self._center_fraction()
         self.current_image = path
         self._label_text = ""
+        video = path.suffix.lower() in VIDEO_EXTS
+        self._set_video_mode(video)
+        if video:
+            self._video_time = 0.0
+            self._video_duration = 0.0
+            self._video_native_size = (0, 0)
+            self._configure_seek_range()
+            self._update_video_bar(0.0)
         self.current_label.config(text=f"Đang tải: {path.name}…")
-        self.status.config(text=f"Đang mở ảnh: {path.name}")
+        self.status.config(text=f"Đang mở {'video' if video else 'ảnh'}: {path.name}")
         self._request_load(path, center)
 
     # ---- loading -------------------------------------------------------
@@ -446,45 +595,106 @@ class VideoImageFilterApp:
             levels.append((factor, current))
         return levels
 
-    def _request_load(self, path: Path, center):
+    def _request_load(self, path: Path, center, video_time=None):
+        """Load `path` in the background. Photos are decoded with Pillow; for a video one
+        full-resolution still frame at `video_time` seconds is extracted with FFmpeg."""
         self._render_token += 1
         token = self._render_token
         if self._render_future is not None:
             self._render_future.cancel()  # drop a queued load; a running one checks its token
+        video = path.suffix.lower() in VIDEO_EXTS
+        exe = self._get_ffmpeg() if video else None
 
         def worker():
             if token != self._render_token:
                 return
             try:
-                with Image.open(path) as opened:
-                    original = ImageOps.exif_transpose(opened).convert("RGB")
+                extra = None
+                if video:
+                    if exe is None:
+                        raise FFmpegMissingError("Không tìm thấy FFmpeg.")
+                    duration, fps = self._probe_video(exe, path)
+                    t = max(0.0, video_time or 0.0)
+                    if duration > 0:
+                        t = min(t, max(0.0, duration - 0.1))
+                    if token != self._render_token:
+                        return
+                    original = self._grab_frame(exe, path, t)
+                    extra = {"duration": duration, "fps": fps, "time": t}
+                else:
+                    with Image.open(path) as opened:
+                        original = ImageOps.exif_transpose(opened).convert("RGB")
                 if token != self._render_token:
                     return
                 levels = self._build_pyramid(original)
-                self._render_queue.put((token, path, levels, None, center))
+                self._render_queue.put((token, path, levels, None, center, extra))
             except Exception as exc:
-                self._render_queue.put((token, path, None, str(exc), center))
+                self._render_queue.put((token, path, None, exc, center, None))
 
         self._render_future = self._render_executor.submit(worker)
 
     def _poll_render_queue(self):
         try:
             while True:
-                token, path, levels, error, center = self._render_queue.get_nowait()
+                token, path, levels, error, center, extra = self._render_queue.get_nowait()
                 if token != self._render_token or path != self.current_image:
                     continue
-                if error:
-                    self.status.config(text=f"Lỗi mở ảnh: {path.name}")
-                    messagebox.showerror("Không mở được ảnh", f"{path}\n\n{error}")
+                if error is not None:
+                    self._report_load_error(path, error)
                     continue
                 self._set_image(levels, center)
+                self._displayed_path = path
+                if extra is not None:
+                    self._on_video_frame_loaded(path, extra)
                 self.status.config(text=f"Đang xem: {path}")
         except queue.Empty:
             pass
-        self.root.after(25, self._poll_render_queue)
+        finally:
+            self.root.after(25, self._poll_render_queue)
+
+    def _report_load_error(self, path: Path, exc: Exception):
+        suffix = path.suffix.lower()
+        if suffix in VIDEO_EXTS:
+            # No modal dialog: the user may be stepping through many videos with the arrow keys.
+            if isinstance(exc, FFmpegMissingError):
+                text = ("Cần FFmpeg để xem video.\n\nBấm “Video → IMG” → “Chọn ffmpeg.exe...”\n"
+                        "hoặc thêm thư mục bin của FFmpeg vào PATH.")
+            else:
+                text = f"Không mở được video:\n{str(exc)[:300]}"
+            self._show_placeholder(text)
+            self.status.config(text=f"Lỗi mở video: {path.name}")
+            return
+        hint = ""
+        if suffix in (".heic", ".heif"):
+            hint = "\n\nĐể mở HEIC/HEIF hãy chạy: py -m pip install pillow-heif"
+        elif suffix == ".avif":
+            hint = "\n\nĐể mở AVIF hãy cập nhật Pillow hoặc chạy: py -m pip install pillow-avif-plugin"
+        self.status.config(text=f"Lỗi mở ảnh: {path.name}")
+        messagebox.showerror("Không mở được ảnh", f"{path}\n\n{exc}{hint}")
+
+    def _show_placeholder(self, text: str):
+        """Empty the viewer but keep `current_image`, and show a message instead."""
+        self._cancel_zoom_animation()
+        self._cancel_hq()
+        self.original_image = None
+        self._pyramid = []
+        self.tk_image = None
+        self._canvas_image_id = None
+        self._frame_size = (0, 0)
+        self._label_text = ""
+        self._displayed_path = None
+        self.canvas.delete("all")
+        self.hbar.set(0.0, 1.0)
+        self.vbar.set(0.0, 1.0)
+        cw, ch = self._viewport()
+        self.canvas.create_text(cw / 2, ch / 2, text=text, fill="#e5e7eb", font=("Segoe UI", 11),
+                                width=max(200, cw - 80), justify=tk.CENTER)
+        if self.current_image is not None:
+            self.current_label.config(text=self.current_image.name)
 
     def _set_image(self, levels, center):
         self._cancel_zoom_animation()
+        self._frame_ratio = 1.0
         self._pyramid = levels
         self.original_image = levels[0][1]
         ow, oh = self.original_image.size
@@ -510,7 +720,7 @@ class VideoImageFilterApp:
             return
         ow, oh = self.original_image.size
         cw, ch = self._viewport()
-        self.fit_scale = min(cw / max(ow, 1), ch / max(oh, 1), 1.0)
+        self.fit_scale = min(cw / max(ow, 1), ch / max(oh, 1), 1.0 / self._frame_ratio)
 
     @staticmethod
     def _clamp_axis(center, size, view, scale):
@@ -626,8 +836,9 @@ class VideoImageFilterApp:
     def _update_label(self):
         if self.current_image is None or self.original_image is None:
             return
-        ow, oh = self.original_image.size
-        zoom_text = "Vừa khung" if self.fit_mode else f"Zoom {round(self.cur_scale * 100)}%"
+        ow, oh = self._native_size()
+        zoom_text = ("Vừa khung" if self.fit_mode
+                     else f"Zoom {round(self.cur_scale * self._frame_ratio * 100)}%")
         text = f"{self.current_image.name}  |  {ow} × {oh}  |  {zoom_text}"
         if text != self._label_text:
             self._label_text = text
@@ -692,7 +903,7 @@ class VideoImageFilterApp:
         target = max(self.MIN_ZOOM, min(self.MAX_ZOOM, target)) if not fit else target
         self.fit_mode = fit
         if not fit:
-            self.zoom = target
+            self.zoom = target * self._frame_ratio      # stored in native-pixel units
         self._zoom_target = target
         self._zoom_anchor = anchor
         if self._zoom_anim_id is None:
@@ -762,6 +973,9 @@ class VideoImageFilterApp:
 
     def rotate_image(self, degrees: int):
         if self.original_image is None or self.current_image is None:
+            return
+        if self.is_video:
+            self.status.config(text="Xoay chỉ dùng cho ảnh; video chỉ xem (khung cắt luôn theo hướng gốc của video).")
             return
         self._cancel_zoom_animation()
         rotated = self.original_image.rotate(degrees, expand=True)
@@ -883,8 +1097,8 @@ class VideoImageFilterApp:
         self.status.config(text="Đã bỏ chọn tất cả ảnh trong toàn bộ danh sách.")
 
     def update_counts(self):
-        self.count_label.config(text=f"{len(self.image_paths)} ảnh | {self._selected_here_count} chọn")
-        self.selected_label.config(text=f"Tổng ảnh đã chọn: {len(self.selected)}")
+        self.count_label.config(text=f"{len(self.image_paths)} file | {self._selected_here_count} chọn")
+        self.selected_label.config(text=f"Tổng file đã chọn: {len(self.selected)}")
 
     def show_relative_image(self, delta: int):
         if not self.image_paths or self.current_image not in self.image_paths:
@@ -896,6 +1110,389 @@ class VideoImageFilterApp:
         self.image_tree.focus(iid)
         self.image_tree.see(iid)
         self.display_image(self.image_paths[idx])
+
+    # ------------------------------------------------------------------
+    # Video preview (FFmpeg): still frame + seek bar + lightweight playback
+    # ------------------------------------------------------------------
+    # A video is shown exactly like a photo: FFmpeg extracts ONE full-resolution frame, which then
+    # goes through the same pyramid / zoom / pan pipeline, so zoom, pan and the zoom-crop frame
+    # behave identically. "Phát" streams down-scaled frames (<= 1280 px, no audio) for a quick look;
+    # pausing or seeking brings back the full-resolution frame.
+    @staticmethod
+    def _row_text(path: Path) -> str:
+        return f"🎬 {path.name}" if path.suffix.lower() in VIDEO_EXTS else path.name
+
+    @staticmethod
+    def _fmt_time(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, rest = divmod(seconds, 3600)
+        minutes, secs = divmod(rest, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+    def _get_ffmpeg(self):
+        if self._ffmpeg_exec is not None and self._ffmpeg_exec.is_file():
+            return self._ffmpeg_exec
+        executable, _note = self._find_ffmpeg()
+        if executable is not None:
+            self._ffmpeg_exec = executable
+        return executable
+
+    def _native_size(self):
+        """Size of the current photo / video frame in native pixels (even while a scaled preview is shown)."""
+        ow, oh = self.original_image.size
+        ratio = self._frame_ratio
+        return (max(1, round(ow / ratio)), max(1, round(oh / ratio)))
+
+    def _probe_video(self, exe: Path, path: Path):
+        """Return (duration seconds, fps) by parsing `ffmpeg -i` output. Cached per file."""
+        cached = self._video_info.get(path)
+        if cached:
+            return cached
+        duration, fps = 0.0, 0.0
+        try:
+            proc = subprocess.run([str(exe), "-hide_banner", "-i", str(path)], capture_output=True,
+                                  timeout=30, creationflags=CREATE_NO_WINDOW)
+            text = proc.stderr.decode("utf-8", "replace")
+            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+            if match:
+                duration = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+            for line in text.splitlines():
+                if "Video:" in line:
+                    match = (re.search(r"(\d+(?:\.\d+)?)\s*fps", line)
+                             or re.search(r"(\d+(?:\.\d+)?)\s*tbr", line))
+                    if match:
+                        fps = float(match.group(1))
+                    break
+        except Exception:
+            pass
+        if not 0.5 <= fps <= 1000:
+            fps = 24.0
+        info = (duration, fps)
+        self._video_info[path] = info
+        return info
+
+    @staticmethod
+    def _grab_frame(exe: Path, path: Path, t: float) -> Image.Image:
+        """Extract one full-resolution frame (already rotated per the video's metadata) as RGB."""
+        attempts = [t]
+        if t > 0:
+            attempts.append(max(0.0, t - 1.0))      # asking for a time past the last frame returns nothing
+        if t > 1.0:
+            attempts.append(0.0)
+        last_error = ""
+        for stamp in attempts:
+            cmd = [str(exe), "-hide_banner", "-loglevel", "error", "-ss", f"{stamp:.3f}", "-i", str(path),
+                   "-frames:v", "1", "-an", "-f", "image2pipe", "-vcodec", "bmp", "pipe:1"]
+            proc = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=CREATE_NO_WINDOW)
+            if proc.returncode == 0 and proc.stdout:
+                try:
+                    with Image.open(io.BytesIO(proc.stdout)) as frame:
+                        return frame.convert("RGB")
+                except Exception as exc:
+                    last_error = str(exc)
+            else:
+                last_error = proc.stderr.decode("utf-8", "replace").strip()[-400:]
+        raise RuntimeError(last_error or "FFmpeg không trích được khung hình nào từ video này.")
+
+    def _set_video_mode(self, enabled: bool):
+        self.is_video = enabled
+        if enabled and not self._video_bar_shown:
+            self.video_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0), before=self.canvas_frame)
+            self._video_bar_shown = True
+        elif not enabled and self._video_bar_shown:
+            self.video_bar.pack_forget()
+            self._video_bar_shown = False
+
+    def _on_video_frame_loaded(self, path: Path, extra: dict):
+        self._video_info[path] = (extra["duration"], extra["fps"])
+        self._video_duration = extra["duration"]
+        self._video_time = extra["time"]
+        self._video_native_size = self.original_image.size
+        self._configure_seek_range()
+        self._update_video_bar()
+
+    def _configure_seek_range(self):
+        self._slider_updating = True
+        try:
+            self.seek_scale.configure(to=max(self._video_duration, 0.1))
+        finally:
+            self._slider_updating = False
+
+    def _update_video_bar(self, t=None):
+        t = self._video_time if t is None else t
+        duration = self._video_duration
+        self._slider_updating = True
+        try:
+            self.seek_scale.set(min(max(t, 0.0), max(duration, 0.1)))
+        finally:
+            self._slider_updating = False
+        total = self._fmt_time(duration) if duration > 0 else "--:--"
+        self.time_label.config(text=f"{self._fmt_time(t)} / {total}")
+        self.play_button.config(text="⏸ Dừng" if self._playing else "▶ Phát")
+
+    # ---- seek bar ------------------------------------------------------
+    def _on_seek_slider(self, value):
+        if self._slider_updating:
+            return
+        total = self._fmt_time(self._video_duration) if self._video_duration > 0 else "--:--"
+        self.time_label.config(text=f"{self._fmt_time(float(value))} / {total}")
+
+    def _on_seek_press(self, _event):
+        self._seek_dragging = True
+
+    def _on_seek_release(self, _event):
+        self._seek_dragging = False
+        if self.is_video and self.current_image is not None:
+            self._seek_to(float(self.seek_scale.get()))
+        self.canvas.focus_set()
+
+    def _seek_to(self, t: float):
+        if not self.is_video or self.current_image is None:
+            return
+        was_playing = self._playing
+        self._stop_playback()
+        if self._video_duration > 0:
+            t = min(t, max(0.0, self._video_duration - 0.1))
+        t = max(0.0, t)
+        self._video_time = t
+        self._update_video_bar(t)
+        if was_playing and self._video_native_size[0] > 0:
+            self._start_playback(t)
+        else:
+            self._request_load(self.current_image, self._center_fraction(), video_time=t)
+
+    def _video_shortcut_allowed(self, event):
+        return self.is_video and event.widget in (self.image_tree, self.canvas, self.seek_scale)
+
+    def _play_shortcut(self, event):
+        if not self._video_shortcut_allowed(event):
+            return
+        self.toggle_play()
+        return "break"
+
+    def _seek_shortcut(self, event, delta: float):
+        if not self._video_shortcut_allowed(event):
+            return
+        self._seek_to(self._video_time + delta)
+        return "break"
+
+    # ---- playback ------------------------------------------------------
+    def toggle_play(self):
+        if not self.is_video or self.current_image is None:
+            return
+        if self._playing:
+            self._pause_playback()
+        else:
+            self._start_playback()
+        self.canvas.focus_set()
+
+    def _start_playback(self, start=None):
+        path = self.current_image
+        if not self.is_video or path is None or self._playing:
+            return
+        exe = self._get_ffmpeg()
+        native_w, native_h = self._video_native_size
+        if exe is None or native_w <= 0 or self.original_image is None:
+            self.status.config(text="Chưa phát được: video chưa tải xong hoặc thiếu FFmpeg.")
+            return
+        duration, fps = self._video_info.get(path, (self._video_duration, 24.0))
+        t0 = self._video_time if start is None else start
+        if duration > 0 and t0 >= duration - 0.3:
+            t0 = 0.0                                   # pressing Play at the end restarts the video
+        fps = max(1.0, min(fps or 24.0, float(PLAY_MAX_FPS)))
+        factor = min(1.0, PLAY_MAX_SIDE / max(native_w, native_h))
+        pw = max(2, int(round(native_w * factor / 2)) * 2)
+        ph = max(2, int(round(native_h * factor / 2)) * 2)
+        cmd = [str(exe), "-hide_banner", "-loglevel", "error", "-ss", f"{t0:.3f}", "-i", str(path), "-an",
+               "-vf", f"fps={fps:g},scale={pw}:{ph}", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    creationflags=CREATE_NO_WINDOW)
+        except OSError as exc:
+            self.status.config(text=f"Không chạy được FFmpeg: {exc}")
+            return
+        self._render_token += 1                         # a late still-frame load must not overwrite the preview
+        if self._render_future is not None:
+            self._render_future.cancel()
+        stop = threading.Event()
+        frames: queue.Queue = queue.Queue(maxsize=6)   # small queue = back-pressure on FFmpeg
+        self._play_proc, self._play_stop, self._play_queue = proc, stop, frames
+        self._play_held = None
+        self._play_t0 = None
+        self._play_start_time = t0
+        self._play_fps = fps
+        self._playing = True
+        self._video_time = t0
+        threading.Thread(target=self._play_reader, args=(proc, stop, frames, pw, ph),
+                         daemon=True, name="video-play").start()
+        self._update_video_bar()
+        self._play_after_id = self.root.after(5, self._play_tick)
+
+    @staticmethod
+    def _play_reader(proc, stop: threading.Event, frames: queue.Queue, pw: int, ph: int):
+        frame_bytes = pw * ph * 3
+
+        def put(item):
+            while not stop.is_set():
+                try:
+                    frames.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        index = 0
+        try:
+            while not stop.is_set():
+                data = proc.stdout.read(frame_bytes)
+                if len(data) < frame_bytes:
+                    break
+                if not put((index, Image.frombytes("RGB", (pw, ph), data))):
+                    return
+                index += 1
+            put((-1, None))                              # end-of-stream marker
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+
+    def _play_tick(self):
+        self._play_after_id = None
+        if not self._playing or self._play_queue is None:
+            return
+        now = time.perf_counter()
+        target = int((now - self._play_t0) * self._play_fps) if self._play_t0 is not None else 0
+        shown = None
+        ended = False
+        while True:
+            if self._play_held is None:
+                try:
+                    self._play_held = self._play_queue.get_nowait()
+                except queue.Empty:
+                    break
+            index, image = self._play_held
+            if index < 0:
+                ended = True
+                self._play_held = None
+                break
+            if self._play_t0 is None:                    # clock starts at the first decoded frame
+                self._play_t0 = now - index / self._play_fps
+                target = index
+            if index <= target:
+                shown = (index, image)                   # frames that are already late are skipped
+                self._play_held = None
+            else:
+                break
+        if shown is not None:
+            index, image = shown
+            self._show_play_frame(image)
+            self._video_time = self._play_start_time + index / self._play_fps
+            if not self._seek_dragging:
+                self._update_video_bar()
+        if ended:
+            self._pause_playback()
+            return
+        self._play_after_id = self.root.after(8, self._play_tick)
+
+    def _show_play_frame(self, image: Image.Image):
+        native_w = self._video_native_size[0]
+        if native_w <= 0:
+            return
+        frame_w, frame_h = image.size
+        fx, fy = self._center_fraction()
+        self._frame_ratio = frame_w / native_w
+        self._pyramid = [(1, image)]
+        self.original_image = image
+        self._update_fit_scale()
+        self.cur_scale = self.fit_scale if self.fit_mode else self.zoom / self._frame_ratio
+        self._zoom_target = self.cur_scale
+        self.view_cx = fx * frame_w
+        self.view_cy = fy * frame_h
+        self._draw_now(hq=False)
+
+    def _stop_playback(self):
+        """Stop FFmpeg and the frame timer. Does not reload the still frame (see _pause_playback)."""
+        if self._play_after_id is not None:
+            try:
+                self.root.after_cancel(self._play_after_id)
+            except tk.TclError:
+                pass
+            self._play_after_id = None
+        if self._play_stop is not None:
+            self._play_stop.set()
+        if self._play_proc is not None:
+            try:
+                self._play_proc.kill()
+            except Exception:
+                pass
+        self._play_proc = self._play_stop = self._play_queue = None
+        self._play_held = None
+        self._play_t0 = None
+        self._playing = False
+        try:
+            self.play_button.config(text="▶ Phát")
+        except tk.TclError:
+            pass
+
+    def _pause_playback(self):
+        """Pause/stop and bring back the full-resolution frame at the current time."""
+        self._stop_playback()
+        if self._video_duration > 0:
+            self._video_time = min(self._video_time, self._video_duration)
+        self._update_video_bar()
+        if self.current_image is not None and self.is_video:
+            self._request_load(self.current_image, self._center_fraction(), video_time=self._video_time)
+
+    def _on_close(self):
+        self._stop_playback()
+        try:
+            self._render_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        self.root.destroy()
+
+    # ------------------------------------------------------------------
+    # Independent pan per file ("Bất đồng bộ di chuyển")
+    # ------------------------------------------------------------------
+    def _on_async_pan_toggle(self):
+        if self.async_pan.get():
+            self._pan_memory.clear()                       # fresh start every time the mode is switched on
+            self._pan_baseline = self._center_fraction()   # where every not-yet-opened file will start
+            self.pan_hint.config(text="Bất đồng bộ: zoom dùng chung, mỗi file nhớ vị trí riêng; file mới mở ở vị trí gốc")
+            self.status.config(text="Đã bật bất đồng bộ di chuyển: vị trí hiện tại được lấy làm vị trí gốc.")
+        else:
+            self.pan_hint.config(text="Đang đồng bộ: zoom và vị trí giữ nguyên khi qua file khác")
+            self.status.config(text="Đã tắt bất đồng bộ di chuyển: zoom và vị trí đồng bộ giữa các file.")
+        self.image_tree.focus_set()                        # keep Space/Enter working on the list
+
+    def _remember_current_pan(self):
+        """Store where the file on screen is panned to (only if its pixels are really displayed)."""
+        if (self.current_image is None or self.original_image is None
+                or self._displayed_path != self.current_image or self.fit_mode):
+            return
+        self._clamp_view()
+        self._pan_memory[self.current_image] = self._center_fraction()
+
+    def reset_pan_current(self):
+        """Put the file on screen back at the baseline position (async mode only)."""
+        if not self.async_pan.get():
+            self.status.config(text="Nút này chỉ dùng khi bật “Bất đồng bộ di chuyển”.")
+            return
+        if self.original_image is None or self.current_image is None:
+            return
+        self._pan_memory.pop(self.current_image, None)
+        fw, fh = self.original_image.size
+        self.view_cx = self._pan_baseline[0] * fw
+        self.view_cy = self._pan_baseline[1] * fh
+        self._draw_now(hq=False)
+        self.status.config(text=f"Đã đưa {self.current_image.name} về vị trí gốc.")
+        self.image_tree.focus_set()
 
     def _load_saved_ffmpeg_path(self):
         config = Path(__file__).with_name("ffmpeg_path.txt")
@@ -1061,7 +1658,7 @@ class VideoImageFilterApp:
         ttk.Button(ffmpeg_buttons, text="Chọn ffmpeg.exe...", command=browse_ffmpeg).pack(side=tk.LEFT)
         update_ffmpeg_status()
 
-        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".m4v", ".webm", ".mpeg", ".mpg", ".3gp", ".mts", ".m2ts"}
+        video_exts = VIDEO_EXTS
 
         def start_extraction():
             executable = update_ffmpeg_status()
@@ -1193,35 +1790,66 @@ class VideoImageFilterApp:
 
     def copy_selected(self):
         if not self.selected:
-            messagebox.showinfo("Chưa chọn ảnh", "Hãy tick ít nhất một ảnh ở danh sách bên trái.")
+            messagebox.showinfo("Chưa chọn file", "Hãy tick ít nhất một ảnh/video ở danh sách bên trái.")
+            return
+        if self._copy_busy:
+            self.status.config(text="Đang copy, vui lòng chờ cho xong...")
             return
         groups: dict[Path, list[Path]] = {}
         for path in sorted(self.selected, key=lambda p: (str(p.parent).lower(), p.name.lower())):
             groups.setdefault(path.parent, []).append(path)
-        copied = skipped = 0
-        errors: list[str] = []
-        for source_dir, files in groups.items():
-            dest_dir = source_dir / "Đã lọc hình"
-            try:
-                dest_dir.mkdir(parents=True, exist_ok=True)
-            except Exception as exc:
-                errors.append(f"{dest_dir}: {exc}")
-                continue
-            for src in files:
-                dest = dest_dir / src.name
-                if dest.exists():
-                    skipped += 1
-                    continue
+        total = sum(len(files) for files in groups.values())
+        events: queue.Queue = queue.Queue()
+        self._copy_busy = True
+
+        def worker():
+            copied = skipped = done = 0
+            errors: list[str] = []
+            for source_dir, files in groups.items():
+                dest_dir = source_dir / "Đã lọc hình"
                 try:
-                    shutil.copy2(src, dest)
-                    copied += 1
+                    dest_dir.mkdir(parents=True, exist_ok=True)
                 except Exception as exc:
-                    errors.append(f"{src.name}: {exc}")
-        summary = f"Đã copy: {copied} ảnh\nBỏ qua do đã tồn tại: {skipped} ảnh\nThư mục đích: mỗi thư mục video/Đã lọc hình"
-        if errors:
-            summary += "\n\nLỗi:\n" + "\n".join(errors[:10])
-        messagebox.showinfo("Kết quả copy", summary)
-        self.status.config(text=f"Copy xong: {copied}, bỏ qua: {skipped}, lỗi: {len(errors)}")
+                    errors.append(f"{dest_dir}: {exc}")
+                    done += len(files)
+                    continue
+                for src in files:
+                    done += 1
+                    events.put(("progress", done, total, src.name))
+                    dest = dest_dir / src.name
+                    if dest.exists():
+                        skipped += 1
+                        continue
+                    try:
+                        shutil.copy2(src, dest)
+                        copied += 1
+                    except Exception as exc:
+                        errors.append(f"{src.name}: {exc}")
+            events.put(("done", copied, skipped, errors))
+
+        def poll():
+            try:
+                while True:
+                    kind, *payload = events.get_nowait()
+                    if kind == "progress":
+                        index, count, name = payload
+                        self.status.config(text=f"Đang copy {index}/{count}: {name}")
+                        continue
+                    copied, skipped, errors = payload
+                    self._copy_busy = False
+                    summary = (f"Đã copy: {copied} file\nBỏ qua do đã tồn tại: {skipped} file\n"
+                               "Thư mục đích: mỗi thư mục gốc của file/Đã lọc hình")
+                    if errors:
+                        summary += "\n\nLỗi:\n" + "\n".join(errors[:10])
+                    self.status.config(text=f"Copy xong: {copied}, bỏ qua: {skipped}, lỗi: {len(errors)}")
+                    messagebox.showinfo("Kết quả copy", summary)
+                    return
+            except queue.Empty:
+                pass
+            self.root.after(80, poll)
+
+        threading.Thread(target=worker, daemon=True, name="copy-selected").start()
+        poll()
 
     # ------------------------------------------------------------------
     # Copy selected images cropped to the current view (zoom level + position)
@@ -1271,15 +1899,59 @@ class VideoImageFilterApp:
         if icc:
             options["icc_profile"] = icc
         ext = dest.suffix.lower()
-        if ext in (".jpg", ".jpeg"):
+        if ext in (".jpg", ".jpeg", ".jpe", ".jfif"):
             options.update(quality=95, subsampling=0)
-        elif ext == ".webp":
+        elif ext in (".webp", ".avif", ".heic", ".heif"):
             options.update(quality=95)
-        part.save(dest, **options)
+        try:
+            part.save(dest, **options)
+        except (ValueError, KeyError, OSError, SyntaxError):
+            # Format that Pillow cannot write here (e.g. .heic without plugin, .ico larger than 256 px):
+            # fall back to a lossless PNG next to it so the crop is never lost.
+            dest.unlink(missing_ok=True)
+            dest = dest.with_suffix(".png")
+            part.save(dest, **({"icc_profile": icc} if icc else {}))
         return box, part.size
 
-    def _run_crop_job(self, files, view, mode, current_path, current_image, progress=None):
-        """Crop every file in `files`. Returns (saved, errors). Safe to run in a worker thread."""
+    def _crop_video(self, src: Path, dest_dir: Path, view, mode: str):
+        """Crop a video to the same region the viewer shows (same zoom / position as photos)."""
+        exe = self._get_ffmpeg()
+        if exe is None:
+            raise FFmpegMissingError("Không tìm thấy FFmpeg (cần để cắt video).")
+        probe = self._grab_frame(exe, src, 0.0)          # real frame size, with rotation metadata applied
+        ow, oh = probe.size
+        left, top, right, bottom = self._view_crop_box((ow, oh), view)
+        scale = self._screen_scale((ow, oh), view) if mode == "screen" else 1.0
+        if (left, top, right, bottom) == (0, 0, ow, oh) and abs(scale - 1.0) < 1e-6:
+            # Whole frame, native size: nothing to crop, so copy the file instead of re-encoding.
+            shutil.copy2(src, dest_dir / f"{src.stem}_crop{src.suffix}")
+            return
+        x, y = left - left % 2, top - top % 2           # yuv420p needs even sizes / offsets
+        w = max(2, (right - left) - (right - left) % 2)
+        h = max(2, (bottom - top) - (bottom - top) % 2)
+        w, h = min(w, ow - x), min(h, oh - y)
+        w, h = w - w % 2, h - h % 2
+        filters = [f"crop={w}:{h}:{x}:{y}"]
+        if abs(scale - 1.0) > 1e-6:
+            sw = max(2, int(round(w * scale / 2)) * 2)
+            sh = max(2, int(round(h * scale / 2)) * 2)
+            filters.append(f"scale={sw}:{sh}:flags=lanczos")
+        dest = dest_dir / f"{src.stem}_crop.mp4"
+        temp = dest_dir / f"{src.stem}_crop.part.mp4"
+        cmd = [str(exe), "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+               "-map", "0:v:0", "-map", "0:a:0?", "-vf", ",".join(filters),
+               "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(temp)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, creationflags=CREATE_NO_WINDOW)
+            if proc.returncode != 0 or not temp.is_file():
+                raise RuntimeError(proc.stderr.decode("utf-8", "replace").strip()[-600:] or "FFmpeg báo lỗi.")
+            os.replace(temp, dest)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def _run_crop_job(self, files, view, mode, current_path, current_image, progress=None, per_file=None):
+        """Crop every file in `files` (photos and videos). Returns (saved, errors). Safe in a worker thread."""
         saved = 0
         errors: list[str] = []
         total = len(files)
@@ -1287,11 +1959,18 @@ class VideoImageFilterApp:
             if progress:
                 progress(index - 1, total, src.name)
             try:
+                src_view = view
+                if per_file is not None:                       # async mode: this file's own position
+                    fx, fy = per_file.get(src, (view["fx"], view["fy"]))
+                    src_view = dict(view, fx=fx, fy=fy)
                 dest_dir = src.parent / "Đã lọc hình"
                 dest_dir.mkdir(parents=True, exist_ok=True)
-                dest = dest_dir / f"{src.stem}_crop{src.suffix}"
-                preloaded = current_image if (src == current_path and current_image is not None) else None
-                self._crop_one(src, dest, view, mode, preloaded)
+                if src.suffix.lower() in VIDEO_EXTS:
+                    self._crop_video(src, dest_dir, src_view, mode)
+                else:
+                    dest = dest_dir / f"{src.stem}_crop{src.suffix}"
+                    preloaded = current_image if (src == current_path and current_image is not None) else None
+                    self._crop_one(src, dest, src_view, mode, preloaded)
                 saved += 1
             except Exception as exc:
                 errors.append(f"{src.name}: {exc}")
@@ -1306,14 +1985,28 @@ class VideoImageFilterApp:
         if self.original_image is None or self.current_image is None:
             messagebox.showinfo("Chưa mở ảnh", "Hãy mở một ảnh và chỉnh zoom/vị trí khung xem trước khi copy.")
             return
+        if self._playing:
+            self._pause_playback()                      # crop from the paused position, not a moving frame
         self._finish_zoom_animation()
         self._clamp_view()
-        ow, oh = self.original_image.size
+        frame_w, frame_h = self.original_image.size     # may be a scaled preview frame while a video plays
+        ow, oh = self._native_size()
         cw, ch = self._viewport()
-        view = {"fit": self.fit_mode, "scale": self.cur_scale, "cw": cw, "ch": ch,
-                "fx": self.view_cx / ow, "fy": self.view_cy / oh}
-        current_path, current_image = self.current_image, self.original_image
+        view = {"fit": self.fit_mode, "scale": self.cur_scale * self._frame_ratio, "cw": cw, "ch": ch,
+                "fx": self.view_cx / frame_w, "fy": self.view_cy / frame_h}
+        current_path = self.current_image
+        current_image = None if self.is_video else self.original_image
         files = sorted(self.selected, key=lambda p: (str(p.parent).lower(), p.name.lower()))
+        video_count = sum(1 for p in files if p.suffix.lower() in VIDEO_EXTS)
+        if video_count and self._get_ffmpeg() is None:
+            messagebox.showerror("Chưa có FFmpeg",
+                                 "Có video trong danh sách chọn nhưng không tìm thấy FFmpeg.\n"
+                                 "Bấm “Video → IMG” → “Chọn ffmpeg.exe...” hoặc thêm FFmpeg vào PATH.")
+            return
+        per_file = None
+        if self.async_pan.get():
+            self._remember_current_pan()
+            per_file = {p: self._pan_memory.get(p, self._pan_baseline) for p in files}
         left, top, right, bottom = self._view_crop_box((ow, oh), view)
 
         dialog = tk.Toplevel(self.root)
@@ -1322,7 +2015,7 @@ class VideoImageFilterApp:
         dialog.resizable(False, False)
         body = ttk.Frame(dialog, padding=14)
         body.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(body, text=f"Cắt {len(files)} ảnh đã chọn theo khung đang xem.",
+        ttk.Label(body, text=f"Cắt {len(files)} file đã chọn theo khung đang xem.",
                   font=("Segoe UI", 10, "bold")).pack(anchor="w")
         if view["fit"]:
             info = "Đang ở chế độ “Vừa khung” → mỗi ảnh được copy nguyên khung hình."
@@ -1330,6 +2023,17 @@ class VideoImageFilterApp:
             info = (f"Zoom {round(view['scale'] * 100)}%  |  vùng cắt trên ảnh đang xem: "
                     f"{right - left} × {bottom - top} px")
         ttk.Label(body, text=info, foreground="#1f4e79", wraplength=430).pack(anchor="w", pady=(6, 8))
+        if per_file is not None:
+            ttk.Label(body, wraplength=430, justify=tk.LEFT, foreground="#1f4e79", font=("Segoe UI", 9),
+                      text="Bất đồng bộ di chuyển: zoom dùng chung, nhưng mỗi file được cắt theo vị trí riêng "
+                           "bạn đã chỉnh; file chưa chỉnh dùng vị trí gốc."
+                      ).pack(anchor="w", pady=(0, 8))
+        if video_count:
+            ttk.Label(body, wraplength=430, justify=tk.LEFT, foreground="#9a3412", font=("Segoe UI", 9),
+                      text=f"Có {video_count} video: cắt bằng FFmpeg, mã hoá lại H.264 (giữ âm thanh) và lưu thành "
+                           "<tên>_crop.mp4 nên lâu hơn ảnh. Riêng khi đang ở “Vừa khung” + giữ độ phân giải gốc, "
+                           "video chỉ được copy nguyên bản."
+                      ).pack(anchor="w", pady=(0, 8))
         scale = self._screen_scale((ow, oh), view)
         native_w, native_h = right - left, bottom - top
         screen_w, screen_h = max(1, round(native_w * scale)), max(1, round(native_h * scale))
@@ -1398,11 +2102,11 @@ class VideoImageFilterApp:
                         saved, errors = payload
                         running["value"] = False
                         close_button.state(["!disabled"])
-                        progress_label.config(text=f"Xong: {saved} ảnh")
-                        summary = f"Đã lưu: {saved} ảnh\nThư mục đích: mỗi thư mục ảnh/Đã lọc hình (đuôi _crop)"
+                        progress_label.config(text=f"Xong: {saved} file")
+                        summary = f"Đã lưu: {saved} file\nThư mục đích: mỗi thư mục gốc của file/Đã lọc hình (đuôi _crop)"
                         if errors:
                             summary += "\n\nLỗi:\n" + "\n".join(errors[:10])
-                        self.status.config(text=f"Copy theo khung zoom xong: {saved} ảnh, lỗi: {len(errors)}")
+                        self.status.config(text=f"Copy theo khung zoom xong: {saved} file, lỗi: {len(errors)}")
                         messagebox.showinfo("Kết quả copy", summary, parent=dialog)
                         dialog.destroy()
                         return
@@ -1420,7 +2124,8 @@ class VideoImageFilterApp:
             def worker():
                 saved, errors = self._run_crop_job(
                     files, view, mode, current_path, current_image,
-                    progress=lambda done, total, name: events.put(("progress", done, total, name)))
+                    progress=lambda done, total, name: events.put(("progress", done, total, name)),
+                    per_file=per_file)
                 events.put(("done", saved, errors))
 
             threading.Thread(target=worker, name="crop-copy", daemon=True).start()
@@ -1436,6 +2141,10 @@ class VideoImageFilterApp:
         start_button.focus_set()
 
     def clear_viewer(self):
+        self._stop_playback()
+        self._set_video_mode(False)
+        self._frame_ratio = 1.0
+        self._displayed_path = None
         self._render_token += 1
         self._cancel_zoom_animation()
         self._cancel_hq()
@@ -1449,7 +2158,7 @@ class VideoImageFilterApp:
         self.canvas.delete("all")
         self.hbar.set(0.0, 1.0)
         self.vbar.set(0.0, 1.0)
-        self.current_label.config(text="Chọn ảnh để xem")
+        self.current_label.config(text="Chọn ảnh hoặc video để xem")
 
 
 def main():
