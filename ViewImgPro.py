@@ -150,6 +150,15 @@ class VideoImageFilterApp:
         self._pan_baseline = (0.5, 0.5)
         self._displayed_path: Path | None = None                  # file whose pixels are on screen right now
 
+        # --- "Bất đồng bộ zoom" (independent zoom per file) ---------------------
+        # OFF (default): the zoom level carries over from file to file.
+        # ON : every file keeps its OWN zoom level (or "Vừa khung"). A file never opened before
+        #      starts at the baseline zoom (the zoom in use when the mode was switched on).
+        #      Independent from "Bất đồng bộ di chuyển": the two options can be combined freely.
+        self.async_zoom = tk.BooleanVar(value=False)
+        self._zoom_memory: dict[Path, tuple[bool, float]] = {}    # path -> (fit_mode, zoom in native px scale)
+        self._zoom_baseline: tuple[bool, float] = (True, 1.0)
+
         self._build_ui()
         # Space and Enter both toggle the checkbox of the image currently being viewed:
         # first press selects; the next press deselects.
@@ -310,7 +319,10 @@ class VideoImageFilterApp:
         pan_row.pack(fill=tk.X, pady=(0, 6))
         ttk.Checkbutton(pan_row, text="Bất đồng bộ di chuyển", variable=self.async_pan,
                         command=self._on_async_pan_toggle).pack(side=tk.LEFT)
-        ttk.Button(pan_row, text="↺ Về vị trí gốc", command=self.reset_pan_current).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(pan_row, text="Bất đồng bộ zoom", variable=self.async_zoom,
+                        command=self._on_async_zoom_toggle).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Button(pan_row, text="↺ Về vị trí gốc", command=self.reset_pan_current).pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Button(pan_row, text="↺ Về zoom gốc", command=self.reset_zoom_current).pack(side=tk.LEFT, padx=(0, 8))
         self.pan_hint = ttk.Label(pan_row, text="Đang đồng bộ: zoom và vị trí giữ nguyên khi qua file khác",
                                   foreground="#4b5563", font=("Segoe UI", 9))
         self.pan_hint.pack(side=tk.LEFT)
@@ -570,6 +582,11 @@ class VideoImageFilterApp:
             center = self._pan_memory.get(path, self._pan_baseline)
         else:
             center = self._center_fraction()
+        if self.async_zoom.get():
+            # Save the zoom of the file we are leaving, then restore the new file's own zoom
+            # (or the baseline zoom if it was never opened). Must happen before current_image changes.
+            self._remember_current_zoom()
+            self.fit_mode, self.zoom = self._zoom_memory.get(path, self._zoom_baseline)
         self.current_image = path
         self._label_text = ""
         video = path.suffix.lower() in VIDEO_EXTS
@@ -1460,16 +1477,62 @@ class VideoImageFilterApp:
     # ------------------------------------------------------------------
     # Independent pan per file ("Bất đồng bộ di chuyển")
     # ------------------------------------------------------------------
+    def _update_sync_hint(self):
+        pan, zoom = self.async_pan.get(), self.async_zoom.get()
+        if pan and zoom:
+            text = "Bất đồng bộ cả zoom và vị trí: mỗi file nhớ zoom và vị trí riêng; file mới mở ở mức gốc"
+        elif pan:
+            text = "Bất đồng bộ: zoom dùng chung, mỗi file nhớ vị trí riêng; file mới mở ở vị trí gốc"
+        elif zoom:
+            text = "Bất đồng bộ zoom: mỗi file nhớ zoom riêng; vị trí vẫn giữ nguyên khi qua file khác"
+        else:
+            text = "Đang đồng bộ: zoom và vị trí giữ nguyên khi qua file khác"
+        self.pan_hint.config(text=text)
+
     def _on_async_pan_toggle(self):
         if self.async_pan.get():
             self._pan_memory.clear()                       # fresh start every time the mode is switched on
             self._pan_baseline = self._center_fraction()   # where every not-yet-opened file will start
-            self.pan_hint.config(text="Bất đồng bộ: zoom dùng chung, mỗi file nhớ vị trí riêng; file mới mở ở vị trí gốc")
             self.status.config(text="Đã bật bất đồng bộ di chuyển: vị trí hiện tại được lấy làm vị trí gốc.")
         else:
-            self.pan_hint.config(text="Đang đồng bộ: zoom và vị trí giữ nguyên khi qua file khác")
-            self.status.config(text="Đã tắt bất đồng bộ di chuyển: zoom và vị trí đồng bộ giữa các file.")
+            self.status.config(text="Đã tắt bất đồng bộ di chuyển: vị trí đồng bộ giữa các file.")
+        self._update_sync_hint()
         self.image_tree.focus_set()                        # keep Space/Enter working on the list
+
+    def _on_async_zoom_toggle(self):
+        if self.async_zoom.get():
+            self._zoom_memory.clear()                      # fresh start every time the mode is switched on
+            self._zoom_baseline = (self.fit_mode, self.zoom)   # where every not-yet-opened file will start
+            self._remember_current_zoom()
+            self.status.config(text="Đã bật bất đồng bộ zoom: zoom hiện tại được lấy làm zoom gốc; mỗi file nhớ zoom riêng.")
+        else:
+            self.status.config(text="Đã tắt bất đồng bộ zoom: zoom dùng chung giữa các file (lấy theo file đang xem).")
+        self._update_sync_hint()
+        self.image_tree.focus_set()
+
+    def _remember_current_zoom(self):
+        """Store the zoom of the file on screen (only if its pixels are really displayed)."""
+        if (self.current_image is None or self.original_image is None
+                or self._displayed_path != self.current_image):
+            return
+        self._zoom_memory[self.current_image] = (self.fit_mode, self.zoom)
+
+    def reset_zoom_current(self):
+        """Put the file on screen back at the baseline zoom (async zoom mode only)."""
+        if not self.async_zoom.get():
+            self.status.config(text="Nút này chỉ dùng khi bật “Bất đồng bộ zoom”.")
+            return
+        if self.original_image is None or self.current_image is None:
+            return
+        self._zoom_memory.pop(self.current_image, None)
+        fit, zoom = self._zoom_baseline
+        if fit:
+            self.fit_image()
+        else:
+            cw, ch = self._viewport()
+            self._zoom_to(zoom / self._frame_ratio, (cw / 2, ch / 2))
+        self.status.config(text=f"Đã đưa zoom của {self.current_image.name} về mức gốc.")
+        self.image_tree.focus_set()
 
     def _remember_current_pan(self):
         """Store where the file on screen is panned to (only if its pixels are really displayed)."""
@@ -1960,9 +2023,8 @@ class VideoImageFilterApp:
                 progress(index - 1, total, src.name)
             try:
                 src_view = view
-                if per_file is not None:                       # async mode: this file's own position
-                    fx, fy = per_file.get(src, (view["fx"], view["fy"]))
-                    src_view = dict(view, fx=fx, fy=fy)
+                if per_file is not None:                       # async mode: this file's own position and/or zoom
+                    src_view = dict(view, **per_file.get(src, {}))
                 dest_dir = src.parent / "Đã lọc hình"
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 if src.suffix.lower() in VIDEO_EXTS:
@@ -2004,9 +2066,18 @@ class VideoImageFilterApp:
                                  "Bấm “Video → IMG” → “Chọn ffmpeg.exe...” hoặc thêm FFmpeg vào PATH.")
             return
         per_file = None
-        if self.async_pan.get():
+        if self.async_pan.get() or self.async_zoom.get():
             self._remember_current_pan()
-            per_file = {p: self._pan_memory.get(p, self._pan_baseline) for p in files}
+            self._remember_current_zoom()
+            per_file = {}
+            for p in files:
+                override = {}
+                if self.async_pan.get():
+                    override["fx"], override["fy"] = self._pan_memory.get(p, self._pan_baseline)
+                if self.async_zoom.get():
+                    fit, zoom = self._zoom_memory.get(p, self._zoom_baseline)
+                    override["fit"], override["scale"] = fit, zoom   # zoom is stored in native-pixel units
+                per_file[p] = override
         left, top, right, bottom = self._view_crop_box((ow, oh), view)
 
         dialog = tk.Toplevel(self.root)
@@ -2024,9 +2095,16 @@ class VideoImageFilterApp:
                     f"{right - left} × {bottom - top} px")
         ttk.Label(body, text=info, foreground="#1f4e79", wraplength=430).pack(anchor="w", pady=(6, 8))
         if per_file is not None:
+            parts = []
+            if self.async_pan.get():
+                parts.append("vị trí")
+            if self.async_zoom.get():
+                parts.append("zoom")
             ttk.Label(body, wraplength=430, justify=tk.LEFT, foreground="#1f4e79", font=("Segoe UI", 9),
-                      text="Bất đồng bộ di chuyển: zoom dùng chung, nhưng mỗi file được cắt theo vị trí riêng "
-                           "bạn đã chỉnh; file chưa chỉnh dùng vị trí gốc."
+                      text=f"Bất đồng bộ {' và '.join(parts)}: mỗi file được cắt theo {' và '.join(parts)} riêng "
+                           "bạn đã chỉnh; file chưa chỉnh dùng mức gốc. "
+                           + ("Số liệu zoom/kích thước ở trên chỉ là của file đang xem."
+                              if self.async_zoom.get() else "")
                       ).pack(anchor="w", pady=(0, 8))
         if video_count:
             ttk.Label(body, wraplength=430, justify=tk.LEFT, foreground="#9a3412", font=("Segoe UI", 9),

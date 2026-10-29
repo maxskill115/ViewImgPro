@@ -14,6 +14,7 @@ Quy trình điển hình: tách video thành ảnh (hoặc xem thẳng video) �
 - **Xem cả video:** video hiện trong cùng danh sách (có biểu tượng 🎬), xem trước, tua và phát được (không có tiếng). Cần FFmpeg.
 - **Giữ nguyên chế độ xem khi chuyển file:** zoom 150% ở file 1 thì sang file 2, 3, 4… vẫn xem 150% ở cùng vị trí tương đối. Rất tiện để so sánh cùng một vùng giữa các khung hình.
 - **Bất đồng bộ di chuyển:** tùy chọn để zoom dùng chung nhưng mỗi file nhớ vị trí kéo riêng.
+- **Bất đồng bộ zoom:** tùy chọn để mỗi file có mức zoom riêng (hoặc "Vừa khung"), đổi zoom ở file này không ảnh hưởng file khác. Kết hợp được với bất đồng bộ di chuyển.
 - **Tick chọn nhanh:** phím `Space` hoặc `Enter` để chọn/bỏ chọn file đang xem; `←` `→` để chuyển file.
 - **Quét thư mục đệ quy:** chọn thư mục gốc, app tự tìm mọi thư mục có ảnh/video.
 - **Copy file đã chọn:** copy nguyên file gốc sang `Đã lọc hình`.
@@ -89,6 +90,15 @@ Mức zoom giới hạn từ 5% đến 800%. Ở chế độ **Vừa khung**, �
 | Bật | Zoom dùng chung, mỗi file nhớ vị trí kéo riêng; file mới mở ở vị trí gốc (vị trí lúc bạn bật tùy chọn) |
 
 Nút **↺ Về vị trí gốc** đưa file đang xem về vị trí gốc, chỉ có tác dụng khi bật chế độ bất đồng bộ.
+
+**Bất đồng bộ zoom** (ô tick cạnh bên):
+
+| Trạng thái | Hành vi khi chuyển file |
+|---|---|
+| Tắt (mặc định) | Mức zoom giữ nguyên giữa các file |
+| Bật | Mỗi file nhớ zoom riêng (kể cả "Vừa khung"); file mới mở ở zoom gốc (zoom lúc bạn bật tùy chọn) |
+
+Nút **↺ Về zoom gốc** đưa file đang xem về zoom gốc, chỉ có tác dụng khi bật chế độ này. Hai tùy chọn bất đồng bộ độc lập nhau, bật riêng hoặc cùng lúc đều được. Khi **Copy cắt theo khung zoom**, mỗi file được cắt theo đúng zoom (và vị trí, nếu bật) riêng của nó.
 
 ### 3. Xem video
 
