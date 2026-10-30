@@ -15,6 +15,9 @@ Selected files are COPIED to the matching folder's "Đã lọc hình" subfolder.
 in the viewer (same zoom level and position) as <name>_crop.<ext> in the same "Đã lọc hình"
 folder. Videos are cropped with FFmpeg and saved as <name>_crop.mp4 (re-encoded H.264, audio kept).
 Original files are never moved or deleted.
+"✂ Cắt video…" (shown under the viewer while a video is open) cuts the video in time with FFmpeg:
+from the start to second X, from second A to second B, or from second A to the end. The result is
+saved in "Đã lọc hình" as <name>_cut_<A>-<B>.<ext>.
 """
 from __future__ import annotations
 
@@ -29,7 +32,9 @@ import tempfile
 import time
 import threading
 import traceback
+import unicodedata
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -63,6 +68,14 @@ MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 PLAY_MAX_SIDE = 1280      # preview playback frames are scaled so the long side is at most this
 PLAY_MAX_FPS = 30         # preview playback frame-rate cap
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# Output folders written by the tool. Compared after Unicode normalisation + case folding so that
+# "Đã lọc hình", "đã lọc hình" and decomposed (NFD) spellings are all recognised.
+FILTERED_DIR_NAMES = {"đã lọc hình", "đã lọc hình_zoom"}
+
+
+def is_filtered_dir_name(name: str) -> bool:
+    return unicodedata.normalize("NFC", name).casefold() in {unicodedata.normalize("NFC", n).casefold()
+                                                            for n in FILTERED_DIR_NAMES}
 
 
 class FFmpegMissingError(RuntimeError):
@@ -137,9 +150,12 @@ class VideoImageFilterApp:
         self._play_start_time = 0.0
         self._play_fps = 24.0
         self._play_after_id = None
+        self._play_limit: float | None = None      # preview of a cut: stop playing at this time (s)
         self._slider_updating = False
         self._seek_dragging = False
         self._copy_busy = False
+        self._cut_busy = False
+        self._cut_dialog = None
 
         # --- "Bất đồng bộ di chuyển" (independent pan per file) -----------------
         # OFF (default): zoom AND position carry over from file to file.
@@ -217,6 +233,9 @@ class VideoImageFilterApp:
         self.root_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
         ttk.Button(top, text="Video → IMG", style="Tool.TButton", command=self.open_video_to_img_dialog).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(top, text="⟳ Tải lại", style="Tool.TButton", command=self.refresh_root).pack(side=tk.RIGHT, padx=(5, 0))
+        self.show_filtered_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="Hiện cả thư mục ‘Đã lọc hình’", variable=self.show_filtered_var,
+                        command=self.refresh_root).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(top, text="Copy file đã chọn", style="Tool.TButton", command=self.copy_selected).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(top, text="✂ Copy cắt theo khung zoom", style="Tool.TButton",
                    command=self.copy_selected_cropped).pack(side=tk.RIGHT, padx=(5, 0))
@@ -353,6 +372,8 @@ class VideoImageFilterApp:
         self.time_label = ttk.Label(self.video_bar, text="00:00 / --:--", width=15, anchor="center",
                                     font=("Segoe UI", 9))
         self.time_label.pack(side=tk.LEFT, padx=6)
+        self.cut_button = ttk.Button(self.video_bar, text="✂ Cắt video…", command=self.open_cut_video_dialog)
+        self.cut_button.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(self.video_bar, text="P: phát/dừng · Shift+←/→: tua 5s · xem trước, không có tiếng",
                   foreground="#4b5563", font=("Segoe UI", 8)).pack(side=tk.RIGHT, padx=(8, 0))
         self.seek_scale = ttk.Scale(self.video_bar, from_=0.0, to=1.0, orient=tk.HORIZONTAL,
@@ -432,15 +453,15 @@ class VideoImageFilterApp:
         # Scan the directory tree, not the list of source videos. This also works
         # when the original .MOV/.MP4 file has been moved or deleted. Every folder
         # that directly contains images becomes a browseable entry; nested folders
-        # are scanned independently. Output folders "Đã lọc hình" (and "Đã lọc hình_zoom" from an earlier version) are excluded.
-        filtered_names = {"đã lọc hình".casefold(), "đã lọc hình_zoom".casefold()}
+        # are scanned independently. Output folders "Đã lọc hình" (and "Đã lọc hình_zoom" from an earlier version)
+        # BELOW the chosen root are skipped unless the "Hiện cả thư mục ‘Đã lọc hình’" box is ticked.
+        # The chosen root itself is always scanned, even when it is called "đã lọc hình".
+        show_filtered = self.show_filtered_var.get()
         found_folders: list[Path] = []
         for current, dirnames, filenames in os.walk(self.root_dir):
             current_path = Path(current)
-            if current_path.name.casefold() in filtered_names:
-                dirnames[:] = []
-                continue
-            dirnames[:] = [name for name in dirnames if name.casefold() not in filtered_names]
+            if not show_filtered:
+                dirnames[:] = [name for name in dirnames if not is_filtered_dir_name(name)]
             if any(Path(filename).suffix.lower() in MEDIA_EXTS for filename in filenames):
                 found_folders.append(current_path)
 
@@ -1412,6 +1433,10 @@ class VideoImageFilterApp:
             self._video_time = self._play_start_time + index / self._play_fps
             if not self._seek_dragging:
                 self._update_video_bar()
+            if self._play_limit is not None and self._video_time >= self._play_limit - 0.01:
+                self._video_time = self._play_limit
+                self._pause_playback()                   # end of the previewed cut: stop on its last frame
+                return
         if ended:
             self._pause_playback()
             return
@@ -1451,6 +1476,7 @@ class VideoImageFilterApp:
         self._play_proc = self._play_stop = self._play_queue = None
         self._play_held = None
         self._play_t0 = None
+        self._play_limit = None
         self._playing = False
         try:
             self.play_button.config(text="▶ Phát")
@@ -1629,8 +1655,8 @@ class VideoImageFilterApp:
     def open_video_to_img_dialog(self):
         win = tk.Toplevel(self.root)
         win.title("Video → IMG | Trích xuất frame bằng FFmpeg")
-        win.geometry("780x455")
-        win.minsize(700, 420)
+        win.geometry("800x540")
+        win.minsize(700, 500)
         win.transient(self.root)
         win.grab_set()
 
@@ -1664,6 +1690,17 @@ class VideoImageFilterApp:
         fps_entry = ttk.Entry(fps_row, textvariable=fps_var, width=12)
         fps_entry.pack(side=tk.LEFT, padx=6)
         ttk.Label(fps_row, text="Mặc định 1 = 1 ảnh/giây; 2 = 2 ảnh/giây; 0.5 = 1 ảnh mỗi 2 giây.").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        min_var = tk.StringVar(value="6")
+        min_row = ttk.Frame(frame)
+        min_row.pack(fill=tk.X, pady=3)
+        ttk.Label(min_row, text="Ảnh tối thiểu / video:", width=22).pack(side=tk.LEFT)
+        ttk.Entry(min_row, textvariable=min_var, width=12).pack(side=tk.LEFT, padx=6)
+        ttk.Label(min_row, text="Video ngắn (1–2 giây) tự lấy dày hơn để đủ số ảnh này (không vượt FPS gốc). 1 = tắt.").pack(
+            side=tk.LEFT, fill=tk.X, expand=True)
+        recursive_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="Quét cả thư mục con (thư mục ảnh được tạo ngay cạnh từng video)",
+                        variable=recursive_var).pack(anchor="w", pady=(3, 0))
 
         ffmpeg_frame = ttk.LabelFrame(frame, text="Kiểm tra FFmpeg", padding=10)
         ffmpeg_frame.pack(fill=tk.X, pady=(8, 8))
@@ -1741,35 +1778,64 @@ class VideoImageFilterApp:
                 messagebox.showerror("FPS không hợp lệ", "Nhập số lớn hơn 0 và không quá 240, ví dụ 1, 2 hoặc 0.5.", parent=win)
                 return
 
-            videos = sorted([p for p in video_folder.iterdir() if p.is_file() and p.suffix.lower() in video_exts], key=lambda p: p.name.casefold())
-            if not videos:
-                messagebox.showinfo("Không tìm thấy video", "Không tìm thấy video trong thư mục đã chọn. Tool quét thư mục này, không quét thư mục con.", parent=win)
+            try:
+                min_frames = int(float(min_var.get().strip().replace(",", ".")))
+                if not 1 <= min_frames <= 1000:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Số ảnh tối thiểu không hợp lệ", "Nhập số nguyên từ 1 đến 1000 (1 = không tăng ảnh cho video ngắn).", parent=win)
                 return
-            def already_done_at_fps(video: Path, requested_fps: float) -> bool:
-                marker = video_folder / video.stem / "_DONE.txt"
+
+            try:
+                if recursive_var.get():
+                    videos = []
+                    for current, dirnames, filenames in os.walk(video_folder):
+                        dirnames[:] = [d for d in dirnames if not is_filtered_dir_name(d)]
+                        videos.extend(Path(current) / fn for fn in filenames if Path(fn).suffix.lower() in video_exts)
+                else:
+                    videos = [p for p in video_folder.iterdir() if p.is_file() and p.suffix.lower() in video_exts]
+            except OSError as exc:
+                messagebox.showerror("Không đọc được thư mục", f"{video_folder}\n\n{exc}", parent=win)
+                return
+            videos.sort(key=lambda p: str(p).casefold())
+            if not videos:
+                messagebox.showinfo("Không tìm thấy video", "Không tìm thấy video trong thư mục đã chọn."
+                                    + ("" if recursive_var.get() else " Tick “Quét cả thư mục con” nếu video nằm trong thư mục con."), parent=win)
+                return
+
+            def already_done(video: Path, requested_fps: float, requested_min: int) -> bool:
+                marker = video.parent / video.stem / "_DONE.txt"
                 if not marker.is_file():
                     return False
                 try:
                     marker_text = marker.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     return True
-                match = re.search(r"^FPS:\s*([0-9]+(?:\.[0-9]+)?)\s*$", marker_text, flags=re.IGNORECASE | re.MULTILINE)
-                if match:
-                    try:
-                        return math.isclose(float(match.group(1)), requested_fps, rel_tol=1e-9, abs_tol=1e-9)
-                    except ValueError:
-                        return False
-                # The older 1.bat had no FPS in its marker but always used fps=1.
-                return math.isclose(requested_fps, 1.0, rel_tol=1e-9, abs_tol=1e-9)
 
-            skipped_done = [v for v in videos if already_done_at_fps(v, fps)]
+                def field(name):
+                    m = re.search(rf"^{name}:\s*([0-9]+(?:\.[0-9]+)?)\s*$", marker_text, flags=re.IGNORECASE | re.MULTILINE)
+                    return float(m.group(1)) if m else None
+
+                done_fps = field("FPS")
+                if done_fps is None:
+                    done_fps = 1.0                         # the older 1.bat had no FPS in its marker but always used fps=1
+                if not math.isclose(done_fps, requested_fps, rel_tol=1e-9, abs_tol=1e-9):
+                    return False
+                done_min = field("MinFrames")
+                if done_min is not None:
+                    return int(done_min) == requested_min
+                # Older marker: redo only if it produced fewer frames than the minimum now requested (short videos).
+                frames = field("Frames")
+                return frames is None or frames >= requested_min
+
+            skipped_done = [v for v in videos if already_done(v, fps, min_frames)]
             queue_videos = [v for v in videos if v not in skipped_done]
             if not queue_videos:
                 messagebox.showinfo("Đã hoàn tất trước đó", f"Tất cả {len(videos)} video đã được xử lý ở {fps:g} FPS và sẽ được bỏ qua.", parent=win)
                 return
             if not messagebox.askyesno(
                 "Xác nhận trích xuất",
-                f"Tìm thấy {len(videos)} video.\nĐã hoàn tất nên bỏ qua: {len(skipped_done)}\nSẽ xử lý: {len(queue_videos)}\n\nFPS: {fps:g} ảnh/giây\nThư mục đầu ra: mỗi video tạo một thư mục cùng tên.\n\nTiếp tục?",
+                f"Tìm thấy {len(videos)} video.\nĐã hoàn tất nên bỏ qua: {len(skipped_done)}\nSẽ xử lý: {len(queue_videos)}\n\nFPS: {fps:g} ảnh/giây (tối thiểu {min_frames} ảnh/video)\nThư mục đầu ra: mỗi video tạo một thư mục cùng tên.\n\nTiếp tục?",
                 parent=win
             ):
                 return
@@ -1780,25 +1846,43 @@ class VideoImageFilterApp:
 
             def extraction_worker():
                 copied_done = 0
+                boosted = 0
                 skipped_existing = len(skipped_done)
                 failures = []
+                quiet = ["-hide_banner", "-loglevel", "error", "-y"]
+
+                def run_ffmpeg(args):
+                    proc = subprocess.run([str(executable)] + quiet + args, capture_output=True, text=True,
+                                          encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
+                    return proc
+
                 for i, video in enumerate(queue_videos, 1):
                     self._video_status_queue.put(("status", f"Đang xử lý {i}/{len(queue_videos)}: {video.name}"))
-                    output_dir = video_folder / video.stem
+                    output_dir = video.parent / video.stem
                     temp_dir = None
                     try:
-                        temp_dir = Path(tempfile.mkdtemp(prefix=f".{video.stem}_ffmpeg_tmp_", dir=str(video_folder)))
+                        temp_dir = Path(tempfile.mkdtemp(prefix=f".{video.stem}_ffmpeg_tmp_", dir=str(video.parent)))
                         output_pattern = str(temp_dir / "frame_%04d.jpg")
-                        command = [
-                            str(executable), "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
-                            "-vf", f"fps={fps:g}", "-q:v", "2", output_pattern
-                        ]
-                        proc = subprocess.run(command, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                        if proc.returncode != 0:
-                            raise RuntimeError((proc.stderr or proc.stdout or f"FFmpeg exited with code {proc.returncode}").strip()[-1800:])
+                        # Short clips: a plain 1 fps pass gives 1-2 frames (or none for <1 s). Raise the rate so the
+                        # clip still yields at least `min_frames` images, but never above the video's own frame rate.
+                        duration, source_fps = self._probe_video_info(executable, video)
+                        fps_used = fps
+                        if duration and duration > 0 and duration * fps < min_frames - 1e-6:
+                            fps_used = min_frames / duration
+                            if source_fps:
+                                fps_used = min(fps_used, source_fps)
+                            fps_used = min(max(fps_used, fps), 240.0)
+                            boosted += 1
+                        proc = run_ffmpeg(["-i", str(video), "-vf", f"fps={fps_used:.6g}", "-q:v", "2", output_pattern])
                         new_frames = sorted(temp_dir.glob("frame_*.jpg"), key=lambda p: p.name.casefold())
                         if not new_frames:
-                            raise RuntimeError("FFmpeg chạy xong nhưng không tạo được ảnh nào.")
+                            # Fallback for clips the fps filter yields nothing for: grab the first decodable frame.
+                            fallback = run_ffmpeg(["-i", str(video), "-frames:v", "1", "-q:v", "2", output_pattern])
+                            new_frames = sorted(temp_dir.glob("frame_*.jpg"), key=lambda p: p.name.casefold())
+                            if not new_frames:
+                                detail = (fallback.stderr or proc.stderr or fallback.stdout or proc.stdout or "").strip()[-1800:]
+                                raise RuntimeError(detail or "FFmpeg chạy xong nhưng không tạo được ảnh nào.")
+                            fps_used = 0.0
                         output_dir.mkdir(parents=True, exist_ok=True)
                         # A folder without _DONE is an incomplete extraction. Replace only generated frame_####.jpg files after the temporary run succeeds.
                         for old in output_dir.iterdir():
@@ -1806,7 +1890,8 @@ class VideoImageFilterApp:
                                 old.unlink()
                         for frame in new_frames:
                             shutil.move(str(frame), str(output_dir / frame.name))
-                        marker_text = f"Completed: {video.name}\nFPS: {fps:g}\nFrames: {len(new_frames)}\n"
+                        marker_text = (f"Completed: {video.name}\nFPS: {fps:g}\nEffectiveFPS: {fps_used:.6g}\n"
+                                       f"MinFrames: {min_frames}\nFrames: {len(new_frames)}\n")
                         (output_dir / "_DONE.txt").write_text(marker_text, encoding="utf-8")
                         copied_done += 1
                     except Exception as exc:
@@ -1814,7 +1899,7 @@ class VideoImageFilterApp:
                     finally:
                         if temp_dir is not None:
                             shutil.rmtree(temp_dir, ignore_errors=True)
-                self._video_status_queue.put(("done", (copied_done, skipped_existing, failures, len(videos), fps, video_folder)))
+                self._video_status_queue.put(("done", (copied_done, skipped_existing, failures, len(videos), fps, video_folder, boosted)))
 
             self._video_status_queue = queue.Queue()
             threading.Thread(target=extraction_worker, daemon=True, name="video-to-img").start()
@@ -1827,12 +1912,13 @@ class VideoImageFilterApp:
                     if kind == "status":
                         status_label.config(text=value)
                     elif kind == "done":
-                        completed, skipped, errors, total, used_fps, out_folder = value
+                        completed, skipped, errors, total, used_fps, out_folder, boosted = value
                         bar.stop()
                         button.state(["!disabled"])
                         self.status.config(text=f"Video → IMG hoàn tất: {completed} đã xử lý, {skipped} bỏ qua, {len(errors)} lỗi.")
                         status_label.config(text=f"Hoàn tất: {completed} xử lý thành công, {skipped} bỏ qua, {len(errors)} lỗi.")
-                        details = f"Xử lý thành công: {completed} video\nĐã bỏ qua: {skipped} video\nLỗi: {len(errors)} video\nFPS: {used_fps:g}\nThư mục: {out_folder}"
+                        details = (f"Xử lý thành công: {completed} video\nĐã bỏ qua: {skipped} video\nLỗi: {len(errors)} video\nFPS: {used_fps:g}\n"
+                                   f"Video ngắn được lấy dày hơn: {boosted} video\nThư mục: {out_folder}")
                         if errors:
                             details += "\n\nChi tiết lỗi:\n" + "\n".join(errors[:8])
                         messagebox.showinfo("Kết quả Video → IMG", details, parent=window)
@@ -1850,6 +1936,601 @@ class VideoImageFilterApp:
                 window.after(100, lambda: poll_extraction_status(window, bar, status_label, button))
 
         run_button.config(command=start_extraction)
+
+    # ------------------------------------------------------------------
+    # Cut a video in time with FFmpeg: start->X, A->B, A->end
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_time(text: str) -> float:
+        """Parse '90', '12.5', '1:30', '1:02:03.5' (comma decimals allowed) into seconds."""
+        text = text.strip().replace(",", ".")
+        parts = text.split(":")
+        if not text or len(parts) > 3:
+            raise ValueError(text)
+        total = 0.0
+        for part in parts:
+            part = part.strip()
+            if not re.fullmatch(r"\d+(?:\.\d+)?", part):
+                raise ValueError(text)
+            total = total * 60 + float(part)
+        return total
+
+    @staticmethod
+    def _plain_seconds(t: float) -> str:
+        return f"{max(0.0, t):.2f}".rstrip("0").rstrip(".") or "0"
+
+    @classmethod
+    def _stamp(cls, t: float) -> str:
+        return f"{cls._plain_seconds(t)}s"
+
+    def _cut_video_file(self, exe: Path, src: Path, start: float, end, precise: bool) -> Path:
+        """Cut src to [start, end] (end=None -> until the end). Returns the saved file."""
+        # Already inside an output folder ("đã lọc hình")? Save beside the source instead of nesting another one.
+        dest_dir = src.parent if is_filtered_dir_name(src.parent.name) else src.parent / "Đã lọc hình"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        label = f"{self._stamp(start)}-{'end' if end is None else self._stamp(end)}"
+        ext = ".mp4" if precise else src.suffix
+        dest = dest_dir / f"{src.stem}_cut_{label}{ext}"
+        temp = dest_dir / f"{src.stem}_cut_{label}.part{ext}"
+        cmd = [str(exe), "-hide_banner", "-loglevel", "error", "-y"]
+        if start > 0:
+            cmd += ["-ss", f"{start:.3f}"]            # before -i: fast seek (frame-accurate when re-encoding)
+        cmd += ["-i", str(src)]
+        if end is not None:
+            cmd += ["-t", f"{end - start:.3f}"]       # length of the output clip
+        cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+        if precise:
+            cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+        else:
+            cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+        cmd.append(str(temp))
+        try:
+            proc = subprocess.run(cmd, capture_output=True, creationflags=CREATE_NO_WINDOW)
+            if proc.returncode != 0 or not temp.is_file():
+                raise RuntimeError(proc.stderr.decode("utf-8", "replace").strip()[-600:] or "FFmpeg báo lỗi.")
+            os.replace(temp, dest)
+        finally:
+            temp.unlink(missing_ok=True)
+        return dest
+
+    def _estimate_reencode_size(self, exe: Path, src: Path, start: float, clip_len: float):
+        """Encode a short sample from the middle of the clip with the same settings as the real cut
+        and extrapolate its size. Returns (estimated bytes, sample seconds)."""
+        sample = min(clip_len, 6.0)
+        sample_start = start + (clip_len - sample) / 2
+        tmp = Path(tempfile.mkdtemp(prefix="viewimgpro_est_"))
+        out = tmp / "sample.mp4"
+        try:
+            cmd = [str(exe), "-hide_banner", "-loglevel", "error", "-y"]
+            if sample_start > 0:
+                cmd += ["-ss", f"{sample_start:.3f}"]
+            cmd += ["-i", str(src), "-t", f"{sample:.3f}", "-map", "0:v:0", "-map", "0:a:0?",
+                    "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)]
+            proc = subprocess.run(cmd, capture_output=True, timeout=180, creationflags=CREATE_NO_WINDOW)
+            if proc.returncode != 0 or not out.is_file():
+                raise RuntimeError(proc.stderr.decode("utf-8", "replace").strip()[-300:] or "FFmpeg báo lỗi.")
+            return out.stat().st_size / sample * clip_len, sample
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @staticmethod
+    def _probe_video_info(exe: Path, media: Path):
+        """(duration seconds or None, video fps or None) read from 'ffmpeg -i' output."""
+        try:
+            proc = subprocess.run([str(exe), "-hide_banner", "-i", str(media)], capture_output=True,
+                                  timeout=60, creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            return None, None
+        text = proc.stderr.decode("utf-8", "replace")
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+        duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else None
+        f = re.search(r"Video:.*?(\d+(?:\.\d+)?)\s*fps", text)
+        return duration, (float(f.group(1)) if f else None)
+
+    @classmethod
+    def _probe_duration(cls, exe: Path, media: Path):
+        """Container duration (s) of a media file, or None if unknown."""
+        return cls._probe_video_info(exe, media)[0]
+
+    def _keyframe_at_or_before(self, exe: Path, src: Path, t: float):
+        """Time (s) of the last video keyframe at or before t, or None if it cannot be found.
+        Only keyframes are decoded (-skip_frame nokey), so this is fast even for long videos."""
+        if t <= 0.05:
+            return 0.0
+        for window in (120.0, None):                            # try a 2-minute window, then from the start
+            scan_start = 0.0 if window is None else max(0.0, t - window)
+            cmd = [str(exe), "-hide_banner", "-loglevel", "info", "-copyts"]
+            if scan_start > 0:
+                cmd += ["-ss", f"{scan_start:.3f}"]
+            cmd += ["-t", f"{t - scan_start + 0.1:.3f}", "-skip_frame", "nokey", "-i", str(src),
+                    "-map", "0:v:0", "-an", "-vf", "showinfo", "-f", "null", "-"]
+            proc = subprocess.run(cmd, capture_output=True, timeout=600, creationflags=CREATE_NO_WINDOW)
+            text = proc.stderr.decode("utf-8", "replace")
+            times = [float(m) for m in re.findall(r"pts_time:\s*(\d+(?:\.\d+)?)", text)]
+            times = [k for k in times if k <= t + 0.05]
+            if times:
+                return max(times)
+            if scan_start <= 0:
+                break
+        return None
+
+    def open_cut_video_dialog(self):
+        path = self.current_image
+        if not self.is_video or path is None:
+            messagebox.showinfo("Cắt video", "Hãy chọn một video ở danh sách bên trái trước.")
+            return
+        if self._cut_busy:
+            self.status.config(text="Đang cắt video, vui lòng chờ cho xong...")
+            return
+        if self._playing:
+            self._pause_playback()
+        exe = self._get_ffmpeg()
+        if exe is None:
+            messagebox.showerror("Chưa có FFmpeg",
+                                 "Không tìm thấy FFmpeg.\nBấm “Video → IMG” → “Chọn ffmpeg.exe...” "
+                                 "hoặc thêm FFmpeg vào PATH.")
+            return
+        if self._cut_dialog is not None and self._cut_dialog.winfo_exists():
+            self._cut_dialog.lift()
+            return
+        duration0 = self._video_duration
+        now0 = self._video_time
+
+        dlg = tk.Toplevel(self.root)
+        self._cut_dialog = dlg
+        dlg.title("Cắt video theo thời gian")
+        dlg.transient(self.root)
+        dlg.resizable(True, True)
+        dlg.minsize(320, 260)
+
+        # --- Fonts / styles that follow the window size (see apply_layout) -------------------
+        base_size = 10
+        f_normal = tkfont.Font(family="Segoe UI", size=base_size)
+        f_bold = tkfont.Font(family="Segoe UI", size=base_size, weight="bold")
+        f_small = tkfont.Font(family="Segoe UI", size=base_size - 1)
+        style = ttk.Style(dlg)
+        style.configure("Cut.TLabel", font=f_normal)
+        style.configure("CutBold.TLabel", font=f_bold)
+        style.configure("CutInfo.TLabel", font=f_normal, foreground="#1f4e79")
+        style.configure("CutLive.TLabel", font=f_small, foreground="#176b35")
+        style.configure("CutHint.TLabel", font=f_small, foreground="#4b5563")
+        style.configure("Cut.TButton", font=f_normal)
+        style.configure("Cut.TRadiobutton", font=f_normal)
+        style.configure("Cut.TLabelframe.Label", font=f_bold)
+
+        body = ttk.Frame(dlg, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(0, weight=1)
+        wrap_labels: list = []        # labels whose wraplength follows the window width
+        hints: list = []              # explanatory text that is hidden when the window is small
+
+        def make_label(parent, text="", style_name="Cut.TLabel", hint=False):
+            lab = ttk.Label(parent, text=text, style=style_name, justify=tk.LEFT, wraplength=430)
+            wrap_labels.append(lab)
+            if hint:
+                hints.append(lab)
+            return lab
+
+        name_label = make_label(body, path.name, "CutBold.TLabel")
+        name_label.grid(row=0, column=0, sticky="ew")
+        info_label = make_label(body, "", "CutInfo.TLabel")
+        info_label.grid(row=1, column=0, sticky="ew", pady=(2, 2))
+        live_hint = make_label(
+            body, style_name="CutLive.TLabel", hint=True,
+            text="Bảng này không khoá cửa sổ chính: cứ kéo thanh tua / bấm Phát / Shift+←→ để tìm cảnh, "
+                 "rồi bấm “Lấy vị trí đang xem”. Có thể kéo bảng sang chỗ khác, hoặc kéo mép bảng để đổi cỡ.")
+        live_hint.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+
+        def live_now():
+            """Position (s) of the video on screen right now, or None if another file is open."""
+            return self._video_time if self.current_image == path else None
+
+        def live_duration():
+            return self._video_duration if self.current_image == path else duration0
+
+        def refresh_info():
+            if not dlg.winfo_exists():
+                return
+            duration = live_duration()
+            total_text = (f"{self._plain_seconds(duration)} giây ({self._fmt_time(duration)})"
+                          if duration > 0 else "chưa rõ")
+            now = live_now()
+            now_text = (f"{self._plain_seconds(now)} giây" if now is not None
+                        else "— (đang xem file khác, hãy mở lại đúng video này)")
+            info_label.config(text=f"Độ dài video: {total_text}   |   Đang xem tại: {now_text}")
+            total_label.config(text=cut_summary())
+            dlg.after(200, refresh_info)
+
+        def cut_summary():
+            """One line telling how long the clip will be with the values currently typed in."""
+            mode = mode_var.get()
+            try:
+                a = 0.0 if mode == "head" else self._parse_time(start_var.get())
+                b = None if mode == "tail" else self._parse_time(end_var.get())
+            except ValueError:
+                return "Đoạn sẽ cắt: thời gian nhập chưa hợp lệ"
+            duration = live_duration()
+            if b is not None and duration > 0 and b >= duration - 0.05:
+                b = None
+            end = b if b is not None else duration
+            if end <= 0:
+                return f"Đoạn sẽ cắt: từ {self._stamp(a)} tới hết video (chưa rõ độ dài)"
+            if end <= a + 0.05:
+                return "Đoạn sẽ cắt: điểm kết thúc phải lớn hơn điểm bắt đầu"
+            end_text = "hết video" if b is None else self._stamp(b)
+            clip = end - a
+            return (f"Sẽ cắt: {self._stamp(a)} → {end_text}  =  {self._plain_seconds(clip)} giây "
+                    f"({self._fmt_time(clip)})")
+
+        def grab(var):
+            now = live_now()
+            if now is None:
+                messagebox.showwarning("Cắt video", f"Bạn đang xem file khác. Hãy mở lại video:\n{path.name}",
+                                       parent=dlg)
+                return
+            var.set(self._plain_seconds(now))
+
+        mode_var = tk.StringVar(value="head")
+        start_var = tk.StringVar(value=self._plain_seconds(now0))
+        end_var = tk.StringVar(value=self._plain_seconds(now0))
+        precise_var = tk.BooleanVar(value=True)
+
+        modes = ttk.LabelFrame(body, text="Kiểu cắt", padding=8, style="Cut.TLabelframe")
+        modes.grid(row=3, column=0, sticky="ew")
+        modes.columnconfigure(0, weight=1)
+        for i, (label, value) in enumerate((("Từ đầu tới giây thứ …", "head"),
+                                            ("Từ giây thứ … tới giây thứ …", "range"),
+                                            ("Từ giây thứ … tới hết", "tail"))):
+            ttk.Radiobutton(modes, text=label, value=value, variable=mode_var,
+                            style="Cut.TRadiobutton").grid(row=i, column=0, sticky="w", pady=2)
+
+        times = ttk.Frame(body)
+        times.grid(row=4, column=0, sticky="ew", pady=(10, 2))
+        times.columnconfigure(1, weight=1)
+        start_label = ttk.Label(times, style="Cut.TLabel")
+        start_label.grid(row=0, column=0, sticky="w", pady=3)
+        start_entry = ttk.Entry(times, textvariable=start_var, width=8, font=f_normal)
+        start_entry.grid(row=0, column=1, padx=6, sticky="ew")
+        start_now = ttk.Button(times, command=lambda: grab(start_var), style="Cut.TButton")
+        start_now.grid(row=0, column=2)
+        end_label = ttk.Label(times, style="Cut.TLabel")
+        end_label.grid(row=1, column=0, sticky="w", pady=3)
+        end_entry = ttk.Entry(times, textvariable=end_var, width=8, font=f_normal)
+        end_entry.grid(row=1, column=1, padx=6, sticky="ew")
+        end_now = ttk.Button(times, command=lambda: grab(end_var), style="Cut.TButton")
+        end_now.grid(row=1, column=2)
+
+        total_label = make_label(times, style_name="CutBold.TLabel")
+        total_label.config(foreground="#b45309")
+        total_label.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+
+        def on_mode(*_args):
+            mode = mode_var.get()
+            start_state = "disabled" if mode == "head" else "normal"
+            end_state = "disabled" if mode == "tail" else "normal"
+            start_entry.config(state=start_state)
+            start_now.config(state=start_state)
+            end_entry.config(state=end_state)
+            end_now.config(state=end_state)
+            now = live_now()
+            if now is not None:
+                if mode == "head":
+                    end_var.set(self._plain_seconds(now))
+                elif mode == "tail":
+                    start_var.set(self._plain_seconds(now))
+
+        mode_var.trace_add("write", on_mode)
+
+        quality = ttk.LabelFrame(body, text="Chất lượng / tốc độ", padding=8, style="Cut.TLabelframe")
+        quality.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        ttk.Radiobutton(quality, text="Chính xác từng khung hình (H.264, lưu .mp4)",
+                        value=True, variable=precise_var, style="Cut.TRadiobutton").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(quality, text="Rất nhanh, không mất chất lượng (copy luồng)",
+                        value=False, variable=precise_var, style="Cut.TRadiobutton").grid(row=1, column=0, sticky="w")
+        quality_hint = make_label(
+            quality, style_name="CutHint.TLabel", hint=True,
+            text="Copy luồng chỉ bắt đầu được tại khung khoá (keyframe). Nếu điểm “Từ” không trúng keyframe, "
+                 "tool sẽ báo trước file thật bắt đầu từ đâu và cho bạn chọn: cắt theo keyframe hoặc cắt chính xác.")
+        quality_hint.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        quality.columnconfigure(0, weight=1)
+
+        tools = ttk.LabelFrame(body, text="Xem trước & ước tính dung lượng", padding=8, style="Cut.TLabelframe")
+        tools.grid(row=6, column=0, sticky="nsew", pady=(10, 0))
+        body.rowconfigure(6, weight=1)
+        tools.columnconfigure(0, weight=1)
+        tools.columnconfigure(1, weight=1)
+        preview_button = ttk.Button(tools, text="▶ Xem trước", command=lambda: preview(), style="Cut.TButton")
+        preview_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        estimate_button = ttk.Button(tools, text="⚖ Ước tính MB", command=lambda: estimate(), style="Cut.TButton")
+        estimate_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        tools_hint = make_label(
+            tools, style_name="CutHint.TLabel", hint=True,
+            text="Xem trước: phát đúng đoạn sẽ cắt ngay trong khung xem chính (độ phân giải thấp, không tiếng).\n"
+                 "Ước tính: cho biết file kết quả nặng khoảng bao nhiêu MB ở từng chế độ.")
+        tools_hint.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        estimate_label = make_label(tools, style_name="CutInfo.TLabel")
+        estimate_label.grid(row=2, column=0, columnspan=2, sticky="ew")
+        save_hint = make_label(
+            body, style_name="CutHint.TLabel", hint=True,
+            text="Kết quả lưu vào thư mục ‘Đã lọc hình’ cạnh video, tên <tên video>_cut_<từ>-<tới>. "
+                 "Video gốc không bị thay đổi.")
+        save_hint.grid(row=7, column=0, sticky="ew", pady=(8, 6))
+
+        progress_label = make_label(body)
+        progress_label.grid(row=8, column=0, sticky="ew")
+        bar = ttk.Progressbar(body, mode="indeterminate")
+        bar.grid(row=9, column=0, sticky="ew", pady=(2, 10))
+        buttons = ttk.Frame(body)
+        buttons.grid(row=10, column=0, sticky="ew")
+        close_button = ttk.Button(buttons, text="Đóng", command=dlg.destroy, style="Cut.TButton")
+        close_button.pack(side=tk.RIGHT)
+        run_button = ttk.Button(buttons, text="Bắt đầu cắt", style="Cut.TButton")
+        run_button.pack(side=tk.RIGHT, padx=(0, 6))
+
+        # --- Responsive layout: font size follows the window, hints disappear when it is small ---
+        layout = {"w0": 0, "h0": 0, "last": None, "job": None}
+
+        def apply_layout():
+            layout["job"] = None
+            if not dlg.winfo_exists() or layout["w0"] <= 0:
+                return
+            w, h = dlg.winfo_width(), dlg.winfo_height()
+            if w < 50 or h < 50:
+                return
+            scale = max(0.8, min(1.8, min(w / layout["w0"], h / layout["h0"])))
+            size = max(8, round(base_size * scale))
+            wrap = max(120, w - 56)
+            narrow = w < 440
+            compact = w < layout["w0"] * 0.85 or h < layout["h0"] * 0.85
+            state = (size, wrap // 8, narrow, compact)
+            if state == layout["last"]:
+                return
+            layout["last"] = state
+            f_normal.configure(size=size)
+            f_bold.configure(size=size)
+            f_small.configure(size=max(7, size - 1))
+            for lab in wrap_labels:
+                lab.config(wraplength=wrap)
+            for hint in hints:
+                if compact:
+                    hint.grid_remove()
+                else:
+                    hint.grid()
+            start_label.config(text="Từ:" if narrow else "Từ (giây hoặc mm:ss):")
+            end_label.config(text="Tới:" if narrow else "Tới (giây hoặc mm:ss):")
+            grab_text = "Lấy" if narrow else "Lấy vị trí đang xem"
+            start_now.config(text=grab_text)
+            end_now.config(text=grab_text)
+            preview_button.config(text="▶ Xem trước" if narrow else "▶ Xem trước đoạn sẽ cắt")
+            estimate_button.config(text="⚖ Ước tính MB" if narrow else "⚖ Ước tính dung lượng")
+
+        def schedule_layout(event):
+            if event.widget is not dlg:
+                return
+            if layout["job"] is not None:
+                dlg.after_cancel(layout["job"])
+            layout["job"] = dlg.after(40, apply_layout)
+
+        start_label.config(text="Từ (giây hoặc mm:ss):")
+        end_label.config(text="Tới (giây hoặc mm:ss):")
+        start_now.config(text="Lấy vị trí đang xem")
+        end_now.config(text="Lấy vị trí đang xem")
+
+        events: queue.Queue = queue.Queue()
+
+        def finish_busy():
+            self._cut_busy = False
+            bar.stop()
+            close_button.state(["!disabled"])
+            run_button.state(["!disabled"])
+
+        def poll():
+            if not dlg.winfo_exists():
+                return
+            try:
+                kind, payload = events.get_nowait()
+            except queue.Empty:
+                dlg.after(100, poll)
+                return
+            finish_busy()
+            if kind == "ok":
+                dest, ca, cb, actual = payload
+                end_text = "hết video" if cb is None else self._stamp(cb)
+                total = live_duration()
+                expected = (cb if cb is not None else total) - ca if (cb is not None or total > 0) else 0
+                lines = [f"Đoạn đã cắt: {self._stamp(ca)} → {end_text}"]
+                if expected > 0:
+                    lines.append(f"Dự kiến dài: {self._plain_seconds(expected)} giây")
+                if actual:
+                    lines.append(f"File thực tế dài: {self._plain_seconds(actual)} giây")
+                    if expected > 0 and abs(actual - expected) > 0.15:
+                        lines.append(f"⚠ Lệch {self._plain_seconds(abs(actual - expected))} giây so với dự kiến.")
+                lines.append(f"Đã lưu:\n{dest}")
+                self.status.config(text=f"Đã cắt video: {dest}")
+                messagebox.showinfo("Cắt video xong", "\n".join(lines), parent=dlg)
+                dlg.destroy()
+            elif kind == "snap":
+                a, b, ka = payload
+                if ka is None or abs(a - ka) < 0.3:
+                    launch(a if ka is None else ka, b, False)
+                    return
+                end_text = "hết video" if b is None else self._stamp(b)
+                answer = messagebox.askyesnocancel(
+                    "Copy luồng không bắt đầu đúng điểm bạn chọn",
+                    f"Bạn chọn bắt đầu từ {self._stamp(a)}, nhưng keyframe gần nhất phía trước là "
+                    f"{self._stamp(ka)}.\nCopy luồng sẽ cho file chạy từ {self._stamp(ka)} → {end_text} "
+                    f"(thừa {self._plain_seconds(a - ka)} giây ở đầu).\n\n"
+                    f"Có: cắt từ {self._stamp(ka)} (nhanh, giữ chất lượng)\n"
+                    f"Không: chuyển sang chế độ chính xác (đúng từ {self._stamp(a)}, mã hoá lại)\n"
+                    "Huỷ: quay lại chỉnh", parent=dlg)
+                if answer is True:
+                    launch(ka, b, False)
+                elif answer is False:
+                    precise_var.set(True)
+                    launch(a, b, True)
+            else:
+                self.status.config(text="Cắt video thất bại.")
+                progress_label.config(text="Lỗi khi cắt video.")
+                messagebox.showerror("Cắt video thất bại", str(payload), parent=dlg)
+
+        def read_range():
+            """Validated (start, end or None for 'to the end') from the form; None after showing an error."""
+            mode = mode_var.get()
+            duration = live_duration()
+            bad = ("Hãy nhập số giây (ví dụ 90 hoặc 12.5) hoặc dạng mm:ss / h:mm:ss (ví dụ 1:30).")
+            try:
+                a = 0.0 if mode == "head" else self._parse_time(start_var.get())
+                b = None if mode == "tail" else self._parse_time(end_var.get())
+            except ValueError:
+                messagebox.showerror("Thời gian không hợp lệ", bad, parent=dlg)
+                return None
+            if duration > 0:
+                if a >= duration - 0.05:
+                    messagebox.showerror("Thời gian không hợp lệ",
+                                         f"Điểm bắt đầu phải nhỏ hơn độ dài video ({self._plain_seconds(duration)} giây).",
+                                         parent=dlg)
+                    return None
+                if b is not None and b >= duration - 0.05:
+                    b = None                                   # reaching the end == cut to the end
+            if b is not None and b <= a + 0.05:
+                messagebox.showerror("Thời gian không hợp lệ", "Điểm kết thúc phải lớn hơn điểm bắt đầu.", parent=dlg)
+                return None
+            return a, b
+
+        def fmt_size(nbytes):
+            mb = nbytes / (1024 * 1024)
+            return f"{mb:.1f} MB" if mb < 1000 else f"{mb / 1024:.2f} GB"
+
+        def preview():
+            rng = read_range()
+            if rng is None:
+                return
+            a, b = rng
+            if self.current_image != path:
+                messagebox.showwarning("Cắt video", f"Bạn đang xem file khác. Hãy mở lại video:\n{path.name}",
+                                       parent=dlg)
+                return
+            if self._video_native_size[0] <= 0 or self.original_image is None:
+                self.status.config(text="Video chưa tải xong, thử lại sau giây lát.")
+                return
+            self._stop_playback()
+            self._start_playback(a)
+            if self._playing:
+                self._play_limit = b                           # None = play to the end of the video
+                end_text = "hết video" if b is None else self._stamp(b)
+                self.status.config(text=f"Xem trước đoạn sẽ cắt: {self._stamp(a)} → {end_text} "
+                                        "(độ phân giải thấp, không có tiếng)")
+
+        est_events: queue.Queue = queue.Queue()
+
+        def poll_estimate():
+            if not dlg.winfo_exists():
+                return
+            try:
+                kind, base, payload = est_events.get_nowait()
+            except queue.Empty:
+                dlg.after(150, poll_estimate)
+                return
+            estimate_button.state(["!disabled"])
+            if kind == "ok":
+                est_bytes, sample = payload
+                tail = (f"• Chính xác (H.264 CRF 18, .mp4): ≈ {fmt_size(est_bytes)}  "
+                        f"(ngoại suy từ mẫu {self._plain_seconds(sample)} giây, sai số có thể ±20–30%)")
+            else:
+                tail = f"• Chính xác (H.264 CRF 18): không ước tính được ({str(payload)[-200:]})"
+            estimate_label.config(text="\n".join(base + [tail]))
+
+        def estimate():
+            rng = read_range()
+            if rng is None:
+                return
+            a, b = rng
+            duration = live_duration()
+            end = b if b is not None else duration
+            if end <= a:
+                estimate_label.config(text="Chưa biết độ dài video nên chưa ước tính được.")
+                return
+            clip = end - a
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            base = [f"Đoạn cắt {self._stamp(a)} → {self._stamp(end)}: dài {self._plain_seconds(clip)} giây "
+                    f"({self._fmt_time(clip)}); video gốc {fmt_size(size)}."]
+            if duration > 0 and size > 0:
+                base.append(f"• Copy luồng (nhanh, giữ chất lượng gốc): ≈ {fmt_size(size * clip / duration)}  "
+                            "(theo bitrate trung bình của video)")
+            estimate_label.config(text="\n".join(base + ["• Chính xác (H.264 CRF 18): đang mã hoá thử một đoạn mẫu…"]))
+            estimate_button.state(["disabled"])
+
+            def worker():
+                try:
+                    est_events.put(("ok", base, self._estimate_reencode_size(exe, path, a, clip)))
+                except Exception as exc:
+                    est_events.put(("err", base, exc))
+
+            threading.Thread(target=worker, daemon=True, name="cut-estimate").start()
+            dlg.after(150, poll_estimate)
+
+        def busy_ui(text):
+            self._cut_busy = True
+            run_button.state(["disabled"])
+            close_button.state(["disabled"])
+            progress_label.config(text=text)
+            bar.start(12)
+
+        def launch(a, b, precise):
+            """Run the real cut with exactly these values (already validated / snapped)."""
+            busy_ui("Đang cắt video bằng FFmpeg... (video dài/chính xác sẽ lâu hơn)")
+
+            def worker():
+                try:
+                    dest = self._cut_video_file(exe, path, a, b, precise)
+                    events.put(("ok", (dest, a, b, self._probe_duration(exe, dest))))
+                except Exception as exc:
+                    events.put(("err", exc))
+
+            threading.Thread(target=worker, daemon=True, name="cut-video").start()
+            dlg.after(100, poll)
+
+        def start():
+            rng = read_range()
+            if rng is None:
+                return
+            a, b = rng                                          # snapshot of the form at the moment of the click
+            if a <= 0 and b is None:
+                messagebox.showinfo("Cắt video", "Khoảng cắt là toàn bộ video, không cần cắt.", parent=dlg)
+                return
+            if precise_var.get():
+                launch(a, b, True)
+                return
+            # Stream copy can only start on a keyframe: find it first so the result matches what we promise.
+            busy_ui("Đang dò keyframe gần điểm bắt đầu...")
+
+            def worker():
+                try:
+                    events.put(("snap", (a, b, self._keyframe_at_or_before(exe, path, a))))
+                except Exception as exc:
+                    events.put(("err", exc))
+
+            threading.Thread(target=worker, daemon=True, name="cut-keyframe").start()
+            dlg.after(100, poll)
+
+        run_button.config(command=start)
+        refresh_info()
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None if self._cut_busy else dlg.destroy())
+        on_mode()
+        dlg.update_idletasks()
+        # Non-modal (no grab_set): the seek bar and Play button of the main window stay usable.
+        # Placed at the top-right so it does not cover the seek bar at the bottom.
+        w0, h0 = max(dlg.winfo_reqwidth(), 460), dlg.winfo_reqheight()
+        layout["w0"], layout["h0"] = w0, h0
+        x = self.root.winfo_rootx() + self.root.winfo_width() - w0 - 30
+        y = self.root.winfo_rooty() + 90
+        dlg.geometry(f"{w0}x{h0}+{max(0, x)}+{max(0, y)}")
+        dlg.bind("<Configure>", schedule_layout)
 
     def copy_selected(self):
         if not self.selected:
